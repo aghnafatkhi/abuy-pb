@@ -1,0 +1,6 @@
+{
+  "name": "Photobooth Abuy",
+  "description": "Aplikasi photobooth online dengan mode solo dan multiplayer 2 orang.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
