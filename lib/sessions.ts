@@ -87,7 +87,7 @@ export function createSession(creatorName: string, creatorId: string): Session {
   const newSession: Session = {
     id,
     status: 'waiting',
-    step: 1,
+    step: 2,
     creatorId,
     mode: 'freestyle',
     memeId: 'pikachu',

@@ -187,6 +187,28 @@ const FILTERS = [
   { id: 'film-mono', name: 'Soft Film Mono', class: 'grayscale contrast-[1.05] brightness-[1.02]', desc: 'Hitam putih vintage halus' }
 ];
 
+const safeLocalStorage = {
+  getItem: (key: string): string | null => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        return localStorage.getItem(key);
+      }
+    } catch (e) {
+      console.warn('localStorage is blocked or not available', e);
+    }
+    return null;
+  },
+  setItem: (key: string, value: string): void => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        localStorage.setItem(key, value);
+      }
+    } catch (e) {
+      console.warn('localStorage is blocked or not available', e);
+    }
+  }
+};
+
 export default function PhotoboothPage() {
   const [playerId, setPlayerId] = useState<string>('');
   const [playerName, setPlayerName] = useState<string>('');
@@ -215,16 +237,18 @@ export default function PhotoboothPage() {
 
   // Sound Effects State
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('photobooth_sound_enabled');
-      if (saved !== null) return saved === 'true';
-    }
+    const saved = safeLocalStorage.getItem('photobooth_sound_enabled');
+    if (saved !== null) return saved === 'true';
     return true;
   });
   const soundEnabledRef = useRef<boolean>(soundEnabled);
 
   // Step-by-Step Workflow State (1: Profil, 2: Frame, 3: Booth, 4: Filter, 5: Download)
   const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
+  const stepRef = useRef<number>(1);
+  useEffect(() => {
+    stepRef.current = step;
+  }, [step]);
   const [maxReachedStep, setMaxReachedStep] = useState<number>(1);
 
   const goToStep = (targetStep: 1 | 2 | 3 | 4 | 5) => {
@@ -257,7 +281,7 @@ export default function PhotoboothPage() {
   const toggleSound = () => {
     setSoundEnabled(prev => {
       const next = !prev;
-      localStorage.setItem('photobooth_sound_enabled', String(next));
+      safeLocalStorage.setItem('photobooth_sound_enabled', String(next));
       return next;
     });
   };
@@ -431,14 +455,14 @@ export default function PhotoboothPage() {
   // Initialize Player ID & Check URL Join Param
   useEffect(() => {
     const timer = setTimeout(() => {
-      let id = localStorage.getItem('photobooth_player_id');
+      let id = safeLocalStorage.getItem('photobooth_player_id');
       if (!id) {
         id = 'player_' + Math.random().toString(36).substring(2, 11);
-        localStorage.setItem('photobooth_player_id', id);
+        safeLocalStorage.setItem('photobooth_player_id', id);
       }
       setPlayerId(id);
 
-      const savedName = localStorage.getItem('photobooth_player_name') || `User-${id.slice(-4)}`;
+      const savedName = safeLocalStorage.getItem('photobooth_player_name') || `User-${id.slice(-4)}`;
       setPlayerName(savedName);
 
       if (typeof window !== 'undefined') {
@@ -457,7 +481,7 @@ export default function PhotoboothPage() {
   // Sync player info to localStorage
   const handleUpdateName = (val: string) => {
     setPlayerName(val);
-    localStorage.setItem('photobooth_player_name', val);
+    safeLocalStorage.setItem('photobooth_player_name', val);
   };
 
   // Web Audio Synthesizer: Sound Effects
@@ -698,7 +722,7 @@ export default function PhotoboothPage() {
           setSession(data);
           
           // Sync step from server in multiplayer mode
-          if (data.step && data.step !== step) {
+          if (data.step && data.step !== stepRef.current) {
             setStep(data.step as any);
             setMaxReachedStep(prev => Math.max(prev, data.step));
           }
@@ -1214,24 +1238,42 @@ export default function PhotoboothPage() {
 
   // Create real-time Multiplayer Room
   const handleCreateRoom = async () => {
+    let activePlayerId = playerId;
+    if (!activePlayerId) {
+      activePlayerId = 'player_' + Math.random().toString(36).substring(2, 11);
+      setPlayerId(activePlayerId);
+      safeLocalStorage.setItem('photobooth_player_id', activePlayerId);
+    }
+
+    let activePlayerName = playerName;
+    if (!activePlayerName) {
+      activePlayerName = `User-${activePlayerId.slice(-4)}`;
+      setPlayerName(activePlayerName);
+      safeLocalStorage.setItem('photobooth_player_name', activePlayerName);
+    }
+
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'create',
-          creatorName: playerName,
-          creatorId: playerId
+          creatorName: activePlayerName,
+          creatorId: activePlayerId
         })
       });
       const data = await res.json();
-      if (!data.error) {
+      if (data.error) {
+        alert(`Gagal membuat room: ${data.error}`);
+      } else {
+        setLobbyMode('multiplayer');
         setRoomCode(data.id);
         setSession(data);
         setStep(2);
       }
     } catch (err) {
       console.error(err);
+      alert('Gagal membuat room. Hubungan internet terputus.');
     }
   };
 
@@ -1243,6 +1285,21 @@ export default function PhotoboothPage() {
       alert('Masukkan Kode Room 4 karakter untuk bergabung.');
       return;
     }
+
+    let activePlayerId = playerId;
+    if (!activePlayerId) {
+      activePlayerId = 'player_' + Math.random().toString(36).substring(2, 11);
+      setPlayerId(activePlayerId);
+      safeLocalStorage.setItem('photobooth_player_id', activePlayerId);
+    }
+
+    let activePlayerName = playerName;
+    if (!activePlayerName) {
+      activePlayerName = `User-${activePlayerId.slice(-4)}`;
+      setPlayerName(activePlayerName);
+      safeLocalStorage.setItem('photobooth_player_name', activePlayerName);
+    }
+
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
@@ -1250,8 +1307,8 @@ export default function PhotoboothPage() {
         body: JSON.stringify({
           action: 'join',
           id: code,
-          playerName,
-          playerId
+          playerName: activePlayerName,
+          playerId: activePlayerId
         })
       });
       const data = await res.json();
