@@ -120,15 +120,15 @@ export async function joinSession(id: string, playerName: string, playerId: stri
       session.players[playerId].active = true;
       session.players[playerId].lastSeen = now;
     } else {
-      // Prune stale/inactive players who haven't sent a heartbeat in 20 seconds
+      // Prune stale/inactive players who haven't sent a heartbeat in 50 seconds
       for (const [pId, p] of Object.entries(session.players)) {
-        if (!p.active || now - p.lastSeen > 20000) {
+        if (!p.active || now - p.lastSeen > 50000) {
           delete session.players[pId];
         }
       }
 
       // Check active players count
-      const activePlayers = Object.values(session.players).filter(p => p.active && now - p.lastSeen < 20000);
+      const activePlayers = Object.values(session.players).filter(p => p.active && now - p.lastSeen < 50000);
       
       if (activePlayers.length >= 2) {
         const playerNames = activePlayers.map(p => p.name).join(' & ');

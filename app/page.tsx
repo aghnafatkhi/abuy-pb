@@ -33,6 +33,8 @@ import {
   StopCircle
 } from 'lucide-react';
 import { draw2RStrip, draw4RLayout } from '@/lib/draw-booth';
+import { doc, onSnapshot } from 'firebase/firestore';
+import { db } from '@/lib/firebase';
 
 // Inline module declaration for gifshot to bypass TypeScript type-checking issues
 declare const window: any;
@@ -220,6 +222,7 @@ export default function PhotoboothPage() {
   
   // Real-time states
   const [session, setSession] = useState<Session | null>(null);
+  const [clockOffset, setClockOffset] = useState<number>(0);
   
   // Local States (Fallback for Solo Mode or Local Setup)
   const [soloSession, setSoloSession] = useState<Session>({
@@ -409,6 +412,15 @@ export default function PhotoboothPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Callback ref to bind camera streams instantly on component mount/remount
+  const setVideoRef = (el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    if (el && streamRef.current) {
+      el.srcObject = streamRef.current;
+      el.play().catch(e => console.warn('Play video on mount error:', e));
+    }
+  };
 
   // Synchronization refs to avoid stale closure bugs in timers/callbacks
   const lobbyModeRef = useRef(lobbyMode);
@@ -701,24 +713,42 @@ export default function PhotoboothPage() {
     }
   }, [step, cameraActive, useUploadFallback]);
 
-  // Real-time Room polling
+  // Real-time Room Syncing using Firestore Real-time Listener and Lightweight Heartbeats
   useEffect(() => {
     if (!roomCode || lobbyMode !== 'multiplayer') return;
 
+    let unsubscribe: () => void;
     let active = true;
-    const controller = new AbortController();
-    let heartbeatTimeout: NodeJS.Timeout;
-    
-    const pollRoom = async () => {
-      if (!active) return;
+
+    // 1. Initial REST fetch to measure round-trip time and calculate clock offset for accurate visual countdown synchronization
+    const measureClockOffset = async () => {
       try {
-        const res = await fetch(`/api/session?id=${roomCode}`, { signal: controller.signal });
-        if (!res.ok) {
-          throw new Error(`HTTP error! Status: ${res.status}`);
-        }
+        const clientSentTime = Date.now();
+        const res = await fetch(`/api/session?id=${roomCode}`);
+        if (!res.ok) return;
+        const clientRecvTime = Date.now();
         const data = await res.json();
         
-        if (active && !data.error) {
+        if (active && data && data.serverTime) {
+          const estimatedClientTime = (clientSentTime + clientRecvTime) / 2;
+          const offset = data.serverTime - estimatedClientTime;
+          setClockOffset(offset);
+          console.log(`Measured server clock offset: ${offset}ms (RTT: ${clientRecvTime - clientSentTime}ms)`);
+        }
+      } catch (err) {
+        console.warn('Failed to measure clock offset:', err);
+      }
+    };
+
+    measureClockOffset();
+
+    // 2. Real-time Firestore document state listener (push-based, ultra low latency)
+    try {
+      const docRef = doc(db, 'sessions', roomCode.toUpperCase());
+      unsubscribe = onSnapshot(docRef, (snapshot: any) => {
+        if (!active) return;
+        if (snapshot.exists()) {
+          const data = snapshot.data() as Session;
           setSession(data);
           
           // Sync step from server in multiplayer mode
@@ -732,43 +762,35 @@ export default function PhotoboothPage() {
             startCamera();
           }
         }
-      } catch (err: any) {
-        if (active && err.name !== 'AbortError') {
-          console.warn('Polling error:', err.message || err);
-        }
-      }
+      }, (err: any) => {
+        console.error('Firestore real-time subscription error:', err);
+      });
+    } catch (e) {
+      console.error('Failed to initialize Firestore listener:', e);
+    }
 
+    // 3. Separate lightweight background heartbeat to update player lastSeen on server every 5 seconds
+    const heartbeatInterval = setInterval(async () => {
       if (!active) return;
-
-      // Send Heartbeat
       try {
         await fetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
           body: JSON.stringify({
             action: 'heartbeat',
             id: roomCode,
             playerId
           })
         });
-      } catch (err: any) {
-        if (active && err.name !== 'AbortError') {
-          console.warn('Heartbeat error:', err.message || err);
-        }
+      } catch (err) {
+        console.warn('Heartbeat update failed:', err);
       }
-
-      if (active) {
-        heartbeatTimeout = setTimeout(pollRoom, 2000);
-      }
-    };
-
-    pollRoom();
+    }, 5000);
 
     return () => {
       active = false;
-      controller.abort();
-      clearTimeout(heartbeatTimeout);
+      if (unsubscribe) unsubscribe();
+      clearInterval(heartbeatInterval);
     };
   }, [roomCode, lobbyMode, view, cameraActive, playerId]);
 
@@ -1054,12 +1076,12 @@ export default function PhotoboothPage() {
     }
   }, [session?.status, view, step, lobbyMode]);
 
-  // Handle Multi-Player Countdown Sync
+  // Handle Multi-Player Countdown Sync with Clock Drift Adjustment
   useEffect(() => {
     if (lobbyMode !== 'multiplayer' || !session || session.status !== 'countdown' || !session.countdownStartAt) return;
 
     // eslint-disable-next-line react-hooks/purity
-    const remaining = session.countdownStartAt - Date.now();
+    const remaining = session.countdownStartAt - (Date.now() + clockOffset);
     
     // Set a timeout to trigger synchronized local visual countdown
     const triggerLocalCountdown = setTimeout(() => {
@@ -1068,7 +1090,7 @@ export default function PhotoboothPage() {
 
     return () => clearTimeout(triggerLocalCountdown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.status, session?.countdownStartAt, session?.currentPhotoIndex]);
+  }, [session?.status, session?.countdownStartAt, session?.currentPhotoIndex, clockOffset]);
 
   // Auto-navigate room players to Step 3 when countdown or taking is active
   useEffect(() => {
@@ -1213,6 +1235,24 @@ export default function PhotoboothPage() {
     }
     
     const isCurrentlyReady = session?.players[playerId]?.isReady || false;
+    const nextReadyState = !isCurrentlyReady;
+
+    // Optimistic local state update to ensure 100% instant visual sync
+    setSession(prev => {
+      if (!prev) return prev;
+      const updatedPlayers = { ...prev.players };
+      if (updatedPlayers[playerId]) {
+        updatedPlayers[playerId] = {
+          ...updatedPlayers[playerId],
+          isReady: nextReadyState
+        };
+      }
+      return {
+        ...prev,
+        players: updatedPlayers
+      };
+    });
+
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
@@ -1221,18 +1261,48 @@ export default function PhotoboothPage() {
           action: 'ready',
           id: targetId,
           playerId,
-          isReady: !isCurrentlyReady
+          isReady: nextReadyState
         })
       });
       const updated = await res.json();
       if (updated.error) {
         alert(`Gagal: ${updated.error}`);
+        // Revert optimistic update
+        setSession(prev => {
+          if (!prev) return prev;
+          const updatedPlayers = { ...prev.players };
+          if (updatedPlayers[playerId]) {
+            updatedPlayers[playerId] = {
+              ...updatedPlayers[playerId],
+              isReady: isCurrentlyReady
+            };
+          }
+          return {
+            ...prev,
+            players: updatedPlayers
+          };
+        });
       } else {
         setSession(updated);
       }
     } catch (err) {
       console.error('Toggle Ready Error:', err);
       alert('Gagal menghubungi server untuk mengubah status siap.');
+      // Revert optimistic update
+      setSession(prev => {
+        if (!prev) return prev;
+        const updatedPlayers = { ...prev.players };
+        if (updatedPlayers[playerId]) {
+          updatedPlayers[playerId] = {
+            ...updatedPlayers[playerId],
+            isReady: isCurrentlyReady
+          };
+        }
+        return {
+          ...prev,
+          players: updatedPlayers
+        };
+      });
     }
   };
 
@@ -2134,7 +2204,7 @@ export default function PhotoboothPage() {
                       </div>
                     )}
                     <video
-                      ref={videoRef}
+                      ref={setVideoRef}
                       autoPlay
                       playsInline
                       muted

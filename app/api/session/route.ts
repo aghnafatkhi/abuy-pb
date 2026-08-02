@@ -25,7 +25,10 @@ export async function GET(req: NextRequest) {
     await cleanExpiredSessions();
   }
 
-  return NextResponse.json(session);
+  return NextResponse.json({
+    ...session,
+    serverTime: Date.now()
+  });
 }
 
 export async function POST(req: NextRequest) {
@@ -43,7 +46,10 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Creator ID is required' }, { status: 400 });
       }
       const session = await createSession(creatorName || 'Player 1', creatorId);
-      return NextResponse.json(session);
+      return NextResponse.json({
+        ...session,
+        serverTime: Date.now()
+      });
     }
 
     if (action === 'join') {
@@ -55,7 +61,10 @@ export async function POST(req: NextRequest) {
       if (!result.success) {
         return NextResponse.json({ error: result.error }, { status: 400 });
       }
-      return NextResponse.json(result.session);
+      return NextResponse.json({
+        ...result.session,
+        serverTime: Date.now()
+      });
     }
 
     if (action === 'ready') {
@@ -80,6 +89,7 @@ export async function POST(req: NextRequest) {
           // Start countdown 1 second from now to allow clock sync
           session.countdownStartAt = Date.now() + 1000;
           session.currentPhotoIndex = 0;
+          session.step = 3; // Ensure both players are routed to Step 3 (Photo booth)
           
           // Clear all old photos for fresh photo shoot
           for (const pid of Object.keys(session.players)) {
@@ -92,7 +102,10 @@ export async function POST(req: NextRequest) {
       if (!updated) {
         return NextResponse.json({ error: 'Session not found' }, { status: 404 });
       }
-      return NextResponse.json(updated);
+      return NextResponse.json({
+        ...updated,
+        serverTime: Date.now()
+      });
     }
 
     if (action === 'update_config') {
@@ -112,7 +125,10 @@ export async function POST(req: NextRequest) {
       if (!updated) {
         return NextResponse.json({ error: 'Session not found' }, { status: 404 });
       }
-      return NextResponse.json(updated);
+      return NextResponse.json({
+        ...updated,
+        serverTime: Date.now()
+      });
     }
 
     if (action === 'upload_photo') {
@@ -168,7 +184,10 @@ export async function POST(req: NextRequest) {
       if (!updated) {
         return NextResponse.json({ error: 'Session not found' }, { status: 404 });
       }
-      return NextResponse.json(updated);
+      return NextResponse.json({
+        ...updated,
+        serverTime: Date.now()
+      });
     }
 
     if (action === 'retake_photo') {
@@ -181,6 +200,7 @@ export async function POST(req: NextRequest) {
         session.status = 'countdown';
         session.currentPhotoIndex = index;
         session.countdownStartAt = Date.now() + 1000;
+        session.step = 3; // Ensure both players stay in Step 3 for the retake
         
         // Remove photo at index for all players so they take the frame together
         for (const pid of Object.keys(session.players)) {
@@ -192,7 +212,10 @@ export async function POST(req: NextRequest) {
       if (!updated) {
         return NextResponse.json({ error: 'Session not found' }, { status: 404 });
       }
-      return NextResponse.json(updated);
+      return NextResponse.json({
+        ...updated,
+        serverTime: Date.now()
+      });
     }
 
     if (action === 'reset') {
@@ -205,6 +228,7 @@ export async function POST(req: NextRequest) {
         session.status = 'waiting';
         session.currentPhotoIndex = 0;
         session.countdownStartAt = undefined;
+        session.step = 2; // Route players back to Step 2 (Frame selection)
         for (const pid of Object.keys(session.players)) {
           session.players[pid].isReady = false;
           session.players[pid].photos = {};
@@ -215,7 +239,10 @@ export async function POST(req: NextRequest) {
       if (!updated) {
         return NextResponse.json({ error: 'Session not found' }, { status: 404 });
       }
-      return NextResponse.json(updated);
+      return NextResponse.json({
+        ...updated,
+        serverTime: Date.now()
+      });
     }
 
     if (action === 'heartbeat') {
@@ -231,10 +258,10 @@ export async function POST(req: NextRequest) {
           player.active = true;
         }
 
-        // Mark players as inactive if no heartbeat in 10 seconds
+        // Mark players as inactive if no heartbeat in 45 seconds (handling blurred tabs and throttle)
         const now = Date.now();
         for (const [pid, p] of Object.entries(session.players)) {
-          if (now - p.lastSeen > 12000) {
+          if (now - p.lastSeen > 45000) {
             p.active = false;
             p.isReady = false;
           }
@@ -244,7 +271,10 @@ export async function POST(req: NextRequest) {
       if (!updated) {
         return NextResponse.json({ error: 'Session not found' }, { status: 404 });
       }
-      return NextResponse.json(updated);
+      return NextResponse.json({
+        ...updated,
+        serverTime: Date.now()
+      });
     }
 
     return NextResponse.json({ error: 'Invalid action' }, { status: 400 });
