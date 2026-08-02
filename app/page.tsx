@@ -223,6 +223,7 @@ export default function PhotoboothPage() {
   // Real-time states
   const [session, setSession] = useState<Session | null>(null);
   const [clockOffset, setClockOffset] = useState<number>(0);
+  const [isUploading, setIsUploading] = useState<boolean>(false);
   
   // Local States (Fallback for Solo Mode or Local Setup)
   const [soloSession, setSoloSession] = useState<Session>({
@@ -431,6 +432,7 @@ export default function PhotoboothPage() {
   const roomCodeRef = useRef(roomCode);
   const isCapturingRef = useRef(isCapturing);
   const cameraActiveRef = useRef(cameraActive);
+  const isUploadingRef = useRef(isUploading);
 
   useEffect(() => {
     lobbyModeRef.current = lobbyMode;
@@ -459,6 +461,10 @@ export default function PhotoboothPage() {
   useEffect(() => {
     isCapturingRef.current = isCapturing;
   }, [isCapturing]);
+
+  useEffect(() => {
+    isUploadingRef.current = isUploading;
+  }, [isUploading]);
 
   useEffect(() => {
     cameraActiveRef.current = cameraActive;
@@ -1025,7 +1031,44 @@ export default function PhotoboothPage() {
         }, 1000);
       }
     } else {
-      // Multiplayer Mode: Upload to Server
+      // Multiplayer Mode: Reset isCapturing IMMEDIATELY after snapshot so subsequent countdowns can fire without race conditions
+      isCapturingRef.current = false;
+      setIsCapturing(false);
+
+      // Save in local session state OPTIMISTICALLY for instant visual feedback!
+      setSession(prev => {
+        if (!prev) return prev;
+        const updatedPlayers = { ...prev.players };
+        if (!updatedPlayers[currentPlayerId]) {
+          updatedPlayers[currentPlayerId] = {
+            id: currentPlayerId,
+            name: currentPlayerName,
+            isReady: false,
+            active: true,
+            photos: {},
+            livePhotos: {}
+          };
+        }
+        updatedPlayers[currentPlayerId] = {
+          ...updatedPlayers[currentPlayerId],
+          photos: {
+            ...updatedPlayers[currentPlayerId].photos,
+            [currentIndex]: mainPhotoUrl
+          },
+          livePhotos: {
+            ...updatedPlayers[currentPlayerId].livePhotos,
+            [currentIndex]: capturedBurst
+          }
+        };
+        return {
+          ...prev,
+          players: updatedPlayers
+        };
+      });
+
+      setIsUploading(true);
+      isUploadingRef.current = true;
+
       try {
         const res = await fetch('/api/session', {
           method: 'POST',
@@ -1041,8 +1084,9 @@ export default function PhotoboothPage() {
         });
         const updated = await res.json();
         
-        isCapturingRef.current = false;
-        setIsCapturing(false);
+        setIsUploading(false);
+        isUploadingRef.current = false;
+
         if (!updated.error) {
           setSession(updated);
           // If finished, transition
@@ -1057,8 +1101,8 @@ export default function PhotoboothPage() {
         }
       } catch (err) {
         console.error('Photo upload error:', err);
-        isCapturingRef.current = false;
-        setIsCapturing(false);
+        setIsUploading(false);
+        isUploadingRef.current = false;
       }
     }
   };
@@ -1438,8 +1482,14 @@ export default function PhotoboothPage() {
       const playerIds = Object.keys(activeSession.players);
       const isSoloGame = lobbyMode === 'solo' || playerIds.length < 2;
 
-      const p1 = activeSession.players[playerIds[0]];
-      const p2 = isSoloGame ? null : activeSession.players[playerIds[1]];
+      // Deterministic player ordering: Host (creator) is always p1, guest is always p2
+      const creatorId = activeSession.creatorId;
+      const p1 = (creatorId && activeSession.players[creatorId]) 
+        ? activeSession.players[creatorId] 
+        : activeSession.players[playerIds[0]];
+      
+      const partnerId = creatorId ? playerIds.find(id => id !== creatorId) : playerIds[1];
+      const p2 = isSoloGame ? null : (partnerId ? activeSession.players[partnerId] : null);
 
       const photos1 = p1 ? [0, 1, 2, 3].map(i => p1.photos[i] || '') : [];
       const photos2 = p2 ? [0, 1, 2, 3].map(i => p2.photos[i] || '') : [];
@@ -1536,8 +1586,14 @@ export default function PhotoboothPage() {
     if (!activeSession) return;
 
     const playerIds = Object.keys(activeSession.players);
-    const p1 = activeSession.players[playerIds[0]];
-    const p2 = playerIds.length > 1 ? activeSession.players[playerIds[1]] : null;
+    // Deterministic player ordering: Host (creator) is always p1, guest is always p2
+    const creatorId = activeSession.creatorId;
+    const p1 = (creatorId && activeSession.players[creatorId]) 
+      ? activeSession.players[creatorId] 
+      : activeSession.players[playerIds[0]];
+    
+    const partnerId = creatorId ? playerIds.find(id => id !== creatorId) : playerIds[1];
+    const p2 = playerIds.length > 1 ? (partnerId ? activeSession.players[partnerId] : null) : null;
 
     const burst1 = p1?.livePhotos?.[idx];
     const burst2 = p2?.livePhotos?.[idx];
@@ -2329,6 +2385,35 @@ export default function PhotoboothPage() {
                   const activePlayersList = session ? Object.values(session.players).filter(p => p.active) : [];
                   const myP = session?.players[playerId];
 
+                  // 1. Check if the active photo-session is in progress (countdown or active take)
+                  if (session?.status === 'countdown' || session?.status === 'taking') {
+                    if (isUploading) {
+                      return (
+                        <button
+                          type="button"
+                          disabled
+                          className="px-4 py-2.5 bg-amber-50 text-amber-600 border border-amber-200 font-bold text-xs rounded-xl transition-all flex items-center space-x-1.5 whitespace-nowrap"
+                        >
+                          <RefreshCw className="w-4 h-4 text-amber-500 animate-spin" />
+                          <span>Mengirim Foto ke Frame...</span>
+                        </button>
+                      );
+                    }
+                    
+                    const activeIndex = (session?.currentPhotoIndex !== undefined) ? session.currentPhotoIndex : 0;
+                    return (
+                      <button
+                        type="button"
+                        disabled
+                        className="px-4 py-2.5 bg-emerald-50 text-emerald-600 border border-emerald-100 font-bold text-xs rounded-xl flex items-center space-x-1.5 whitespace-nowrap cursor-default animate-pulse"
+                      >
+                        <Camera className="w-4 h-4 text-emerald-600" />
+                        <span>Mengambil Foto ke-{activeIndex + 1} dari 4</span>
+                      </button>
+                    );
+                  }
+
+                  // 2. Otherwise we are waiting for player readiness to start/restart the session
                   if (activePlayersList.length < 2) {
                     return (
                       <button
@@ -2388,8 +2473,15 @@ export default function PhotoboothPage() {
                   {[0, 1, 2, 3].map((slotIdx) => {
                     const activeS = lobbyMode === 'solo' ? soloSession : session;
                     const pKeys = activeS ? Object.keys(activeS.players) : [];
-                    const p1 = activeS?.players[pKeys[0]];
-                    const p2 = (lobbyMode === 'multiplayer' && pKeys.length >= 2) ? activeS?.players[pKeys[1]] : null;
+                    
+                    // Deterministic ordering: Host (creator) is always p1, guest (partner) is always p2
+                    const creatorId = activeS?.creatorId;
+                    const p1 = (activeS && creatorId && activeS.players[creatorId]) 
+                      ? activeS.players[creatorId] 
+                      : (activeS ? activeS.players[pKeys[0]] : null);
+                    
+                    const partnerId = activeS && creatorId ? pKeys.find(id => id !== creatorId) : pKeys[1];
+                    const p2 = (lobbyMode === 'multiplayer' && activeS && partnerId) ? activeS.players[partnerId] : null;
 
                     const p1Img = p1?.photos[slotIdx];
                     const p2Img = p2?.photos[slotIdx];
