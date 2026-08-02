@@ -30,7 +30,8 @@ import {
   ChevronRight,
   ChevronLeft,
   XCircle,
-  StopCircle
+  StopCircle,
+  Lock
 } from 'lucide-react';
 import { draw2RStrip, draw4RLayout } from '@/lib/draw-booth';
 import { doc, onSnapshot } from 'firebase/firestore';
@@ -224,6 +225,21 @@ export default function PhotoboothPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [clockOffset, setClockOffset] = useState<number>(0);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+  
+  // Local sequence states for continuous automated photo shoot
+  const [localShootActive, setLocalShootActive] = useState<boolean>(false);
+  const [localPhotoIndex, setLocalPhotoIndex] = useState<number>(0);
+
+  const localShootActiveRef = useRef<boolean>(false);
+  const localPhotoIndexRef = useRef<number>(0);
+
+  useEffect(() => {
+    localShootActiveRef.current = localShootActive;
+  }, [localShootActive]);
+
+  useEffect(() => {
+    localPhotoIndexRef.current = localPhotoIndex;
+  }, [localPhotoIndex]);
   
   // Local States (Fallback for Solo Mode or Local Setup)
   const [soloSession, setSoloSession] = useState<Session>({
@@ -574,6 +590,12 @@ export default function PhotoboothPage() {
     setIsCapturing(false);
     setCountdown(null);
     setFlashActive(false);
+
+    // Reset local sequence states
+    setLocalShootActive(false);
+    localShootActiveRef.current = false;
+    setLocalPhotoIndex(0);
+    localPhotoIndexRef.current = 0;
   };
 
   // Web Audio Synthesizer: Countdown Tick Sound
@@ -831,6 +853,59 @@ export default function PhotoboothPage() {
     return [...burstBuffer.current];
   };
  
+  // Start countdown for a single shot within the automated sequence
+  const startAutomatedShot = () => {
+    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    if (autoShootTimeoutRef.current) clearTimeout(autoShootTimeoutRef.current);
+
+    isCapturingRef.current = true;
+    setIsCapturing(true);
+    setCountdown(3);
+    playCountdownTickSound(false);
+    
+    startBurstRecording();
+
+    let counter = 3;
+    countdownIntervalRef.current = setInterval(() => {
+      counter--;
+      if (counter > 0) {
+        setCountdown(counter);
+        playCountdownTickSound(counter === 1);
+      } else {
+        if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+        setCountdown(null);
+        triggerFlashAndCapture();
+      }
+    }, 1000);
+  };
+
+  // Start the entire 4-photo shoot sequence with all user inputs locked
+  const startFullPhotoShootSequence = () => {
+    stopPhotoShoot();
+
+    setLocalShootActive(true);
+    localShootActiveRef.current = true;
+    setLocalPhotoIndex(0);
+    localPhotoIndexRef.current = 0;
+
+    if (lobbyModeRef.current === 'solo') {
+      setSoloSession(prev => ({
+        ...prev,
+        currentPhotoIndex: 0,
+        status: 'taking'
+      }));
+    } else {
+      setSession(prev => prev ? ({
+        ...prev,
+        currentPhotoIndex: 0,
+        status: 'taking'
+      }) : null);
+    }
+
+    startAutomatedShot();
+  };
+
   // Perform Local Visual Countdown before taking a photo
   const startLocalVisualCountdown = () => {
     if (isCapturingRef.current) return;
@@ -887,9 +962,11 @@ export default function PhotoboothPage() {
     const currentSoloSession = soloSessionRef.current;
     const currentSession = sessionRef.current;
 
-    const currentIndex = currentLobbyMode === 'solo' 
-      ? currentSoloSession.currentPhotoIndex 
-      : (currentSession?.currentPhotoIndex || 0);
+    const currentIndex = localShootActiveRef.current 
+      ? localPhotoIndexRef.current
+      : (currentLobbyMode === 'solo' 
+          ? currentSoloSession.currentPhotoIndex 
+          : (currentSession?.currentPhotoIndex || 0));
 
     let mainPhotoUrl = '';
     let capturedBurst: string[] = [];
@@ -987,54 +1064,48 @@ export default function PhotoboothPage() {
         
         updatedPlayers[currentPlayerId].photos[currentIndex] = mainPhotoUrl;
         updatedPlayers[currentPlayerId].livePhotos[currentIndex] = capturedBurst;
- 
-        const allDone = [0, 1, 2, 3].every(i => updatedPlayers[currentPlayerId].photos[i] !== undefined);
-
-        let nextIdx = currentIndex + 1;
-        while (nextIdx < 4 && updatedPlayers[currentPlayerId].photos[nextIdx] !== undefined) {
-          nextIdx++;
-        }
-        if (nextIdx >= 4) {
-          nextIdx = [0, 1, 2, 3].find(i => updatedPlayers[currentPlayerId].photos[i] === undefined) ?? 3;
-        }
 
         return {
           ...prev,
-          currentPhotoIndex: allDone ? 3 : nextIdx,
-          status: allDone ? 'finished' : 'countdown',
           players: updatedPlayers
         };
       });
 
-      const soloPhotos = soloSessionRef.current?.players?.[currentPlayerId]?.photos || {};
-      const checkAll4 = [0, 1, 2, 3].every(i => (i === currentIndex ? mainPhotoUrl : soloPhotos[i]) !== undefined);
-
-      if (!checkAll4) {
-        autoShootTimeoutRef.current = setTimeout(() => {
-          if (isCapturingRef.current) {
+      if (localShootActiveRef.current) {
+        if (currentIndex < 3) {
+          autoShootTimeoutRef.current = setTimeout(() => {
+            const nextIdx = currentIndex + 1;
+            setLocalPhotoIndex(nextIdx);
+            localPhotoIndexRef.current = nextIdx;
+            
             setSoloSession(prev => ({
               ...prev,
-              status: 'countdown'
+              currentPhotoIndex: nextIdx
             }));
-            isCapturingRef.current = false;
-            setIsCapturing(false);
-            startLocalVisualCountdown();
-          }
-        }, 1500);
+
+            startAutomatedShot();
+          }, 1500);
+        } else {
+          autoShootTimeoutRef.current = setTimeout(() => {
+            stopPhotoShoot();
+            setStep(4);
+            setView('gallery');
+            playSessionCompleteSound();
+            stopCamera();
+          }, 1500);
+        }
       } else {
+        // Single retake shot for Solo Mode
         autoShootTimeoutRef.current = setTimeout(() => {
           stopPhotoShoot();
           setStep(4);
           setView('gallery');
           playSessionCompleteSound();
           stopCamera();
-        }, 1000);
+        }, 1500);
       }
     } else {
-      // Multiplayer Mode: Reset isCapturing IMMEDIATELY after snapshot so subsequent countdowns can fire without race conditions
-      isCapturingRef.current = false;
-      setIsCapturing(false);
-
+      // Multiplayer Mode
       // Save in local session state OPTIMISTICALLY for instant visual feedback!
       setSession(prev => {
         if (!prev) return prev;
@@ -1066,43 +1137,83 @@ export default function PhotoboothPage() {
         };
       });
 
+      // Background Upload
       setIsUploading(true);
       isUploadingRef.current = true;
 
-      try {
-        const res = await fetch('/api/session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'upload_photo',
-            id: currentRoomCode,
-            playerId: currentPlayerId,
-            index: currentIndex,
-            photo: mainPhotoUrl,
-            livePhotos: capturedBurst
-          })
-        });
-        const updated = await res.json();
-        
+      fetch('/api/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'upload_photo',
+          id: currentRoomCode,
+          playerId: currentPlayerId,
+          index: currentIndex,
+          photo: mainPhotoUrl,
+          livePhotos: capturedBurst
+        })
+      })
+      .then(res => res.json())
+      .then(updated => {
         setIsUploading(false);
         isUploadingRef.current = false;
-
-        if (!updated.error) {
-          setSession(updated);
-          // If finished, transition
-          if (currentIndex >= 3 && updated.status === 'finished') {
-            setTimeout(() => {
-              setStep(4);
-              setView('gallery');
-              playSessionCompleteSound();
-              stopCamera();
-            }, 1000);
-          }
+        if (updated && !updated.error) {
+          setSession(prev => {
+            if (!prev) return updated;
+            return {
+              ...updated,
+              players: {
+                ...updated.players,
+                [currentPlayerId]: {
+                  ...updated.players[currentPlayerId],
+                  photos: {
+                    ...updated.players[currentPlayerId]?.photos,
+                    ...prev.players[currentPlayerId]?.photos
+                  },
+                  livePhotos: {
+                    ...updated.players[currentPlayerId]?.livePhotos,
+                    ...prev.players[currentPlayerId]?.livePhotos
+                  }
+                }
+              }
+            };
+          });
         }
-      } catch (err) {
+      })
+      .catch(err => {
         console.error('Photo upload error:', err);
         setIsUploading(false);
         isUploadingRef.current = false;
+      });
+
+      if (localShootActiveRef.current) {
+        if (currentIndex < 3) {
+          autoShootTimeoutRef.current = setTimeout(() => {
+            const nextIdx = currentIndex + 1;
+            setLocalPhotoIndex(nextIdx);
+            localPhotoIndexRef.current = nextIdx;
+            
+            // Optimistically update currentPhotoIndex
+            setSession(prev => prev ? ({
+              ...prev,
+              currentPhotoIndex: nextIdx
+            }) : null);
+
+            startAutomatedShot();
+          }, 1500);
+        } else {
+          autoShootTimeoutRef.current = setTimeout(() => {
+            stopPhotoShoot();
+            setStep(4);
+            setView('gallery');
+            playSessionCompleteSound();
+            stopCamera();
+          }, 1500);
+        }
+      } else {
+        // Single retake shot for Multiplayer
+        isCapturingRef.current = false;
+        setIsCapturing(false);
       }
     }
   };
@@ -1124,12 +1235,19 @@ export default function PhotoboothPage() {
   useEffect(() => {
     if (lobbyMode !== 'multiplayer' || !session || session.status !== 'countdown' || !session.countdownStartAt) return;
 
+    // If local sequence photoshoot is already active, ignore any incoming server countdown triggers
+    if (localShootActiveRef.current) return;
+
     // eslint-disable-next-line react-hooks/purity
     const remaining = session.countdownStartAt - (Date.now() + clockOffset);
     
     // Set a timeout to trigger synchronized local visual countdown
     const triggerLocalCountdown = setTimeout(() => {
-      startLocalVisualCountdown();
+      if (session.currentPhotoIndex === 0) {
+        startFullPhotoShootSequence();
+      } else {
+        startLocalVisualCountdown();
+      }
     }, Math.max(0, remaining));
 
     return () => clearTimeout(triggerLocalCountdown);
@@ -2354,16 +2472,30 @@ export default function PhotoboothPage() {
               <div className="w-full flex items-center justify-between pt-2">
                 <button
                   type="button"
+                  disabled={localShootActive}
                   onClick={() => {
                     stopPhotoShoot();
                     goToStep(2);
                   }}
-                  className="px-3 py-2 bg-pink-50 hover:bg-pink-100 text-pink-700 text-xs font-semibold rounded-xl border border-pink-200 transition-all whitespace-nowrap"
+                  className={`px-3 py-2 text-xs font-semibold rounded-xl border transition-all whitespace-nowrap ${
+                    localShootActive 
+                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                      : 'bg-pink-50 hover:bg-pink-100 text-pink-700 border-pink-200'
+                  }`}
                 >
                   ← Ubah Frame
                 </button>
 
-                {isCapturing ? (
+                {localShootActive ? (
+                  <button
+                    type="button"
+                    disabled
+                    className="px-4 py-2.5 bg-emerald-50 text-emerald-600 border border-emerald-100 font-bold text-xs rounded-xl flex items-center space-x-1.5 whitespace-nowrap cursor-default animate-pulse"
+                  >
+                    <Lock className="w-4 h-4 text-emerald-600" />
+                    <span>Sesi Foto Berjalan... (Foto {localPhotoIndex + 1} dari 4)</span>
+                  </button>
+                ) : isCapturing ? (
                   <button
                     type="button"
                     onClick={stopPhotoShoot}
@@ -2375,7 +2507,7 @@ export default function PhotoboothPage() {
                 ) : lobbyMode === 'solo' ? (
                   <button
                     type="button"
-                    onClick={startLocalVisualCountdown}
+                    onClick={startFullPhotoShootSequence}
                     className="px-4 py-2.5 bg-pink-500 hover:bg-pink-600 text-white font-bold text-xs rounded-xl shadow-xs shadow-pink-200 transition-all flex items-center space-x-1.5 whitespace-nowrap"
                   >
                     <Camera className="w-4 h-4 text-white" />
