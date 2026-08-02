@@ -244,8 +244,8 @@ export default function PhotoboothPage() {
     setStep(targetStep);
     setMaxReachedStep(prev => Math.max(prev, targetStep));
 
-    // Sync step to multiplayer server if we are the room creator
-    if (lobbyMode === 'multiplayer' && roomCode && session?.creatorId === playerId) {
+    // Sync step to multiplayer server if in multiplayer mode
+    if (lobbyMode === 'multiplayer' && (roomCode || session?.id)) {
       handleUpdateConfig({ step: targetStep });
     }
   };
@@ -1180,7 +1180,14 @@ export default function PhotoboothPage() {
   };
 
   // Toggle Multiplayer Ready State
+  // Join/Ready Multiplayer toggle
   const handleToggleReady = async () => {
+    const targetId = roomCode || session?.id;
+    if (!targetId) {
+      console.error('Cannot toggle ready: No Room ID found.');
+      return;
+    }
+    
     const isCurrentlyReady = session?.players[playerId]?.isReady || false;
     try {
       const res = await fetch('/api/session', {
@@ -1188,15 +1195,20 @@ export default function PhotoboothPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'ready',
-          id: roomCode,
+          id: targetId,
           playerId,
           isReady: !isCurrentlyReady
         })
       });
       const updated = await res.json();
-      if (!updated.error) setSession(updated);
+      if (updated.error) {
+        alert(`Gagal: ${updated.error}`);
+      } else {
+        setSession(updated);
+      }
     } catch (err) {
-      console.error(err);
+      console.error('Toggle Ready Error:', err);
+      alert('Gagal menghubungi server untuk mengubah status siap.');
     }
   };
 
@@ -1886,9 +1898,9 @@ export default function PhotoboothPage() {
                 <div>
                   <div className="flex items-center justify-between mb-0.5">
                     <h3 className="text-base font-bold text-slate-800">Pilih Warna Frame</h3>
-                    {lobbyMode === 'multiplayer' && session?.creatorId === playerId && (
-                      <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-[10px] font-bold rounded-full border border-amber-200">
-                        ADMIN ROOM
+                    {lobbyMode === 'multiplayer' && (
+                      <span className="px-2 py-0.5 bg-pink-100 text-pink-700 text-[10px] font-bold rounded-full border border-pink-200 uppercase">
+                        Berbagi Frame
                       </span>
                     )}
                   </div>
@@ -1900,12 +1912,11 @@ export default function PhotoboothPage() {
                         key={overlay.id}
                         type="button"
                         onClick={() => handleUpdateConfig({ overlayId: overlay.id })}
-                        disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
                         className={`py-2 px-3 rounded-xl border text-left transition-all flex items-center justify-between whitespace-nowrap ${
                           activeConfig.overlayId === overlay.id
                             ? 'ring-2 ring-pink-500 border-pink-400 shadow-xs font-bold'
                             : 'border-pink-100 hover:border-pink-300'
-                        } ${lobbyMode === 'multiplayer' && session?.creatorId !== playerId ? 'opacity-70 cursor-not-allowed' : ''}`}
+                        }`}
                         style={{ backgroundColor: overlay.bg }}
                       >
                         <span className="text-xs font-bold truncate" style={{ color: overlay.text }}>{overlay.name}</span>
@@ -1919,12 +1930,6 @@ export default function PhotoboothPage() {
 
                 {/* Step Actions */}
                 <div className="flex flex-col space-y-2 pt-2 border-t border-pink-100">
-                  {lobbyMode === 'multiplayer' && session?.creatorId !== playerId && (
-                    <p className="text-[10px] text-center text-pink-600 font-medium mb-1 italic">
-                      Hanya Pembuat Room yang bisa memilih frame dan memulai sesi.
-                    </p>
-                  )}
-                  
                   <div className="flex items-center space-x-2">
                     <button
                       type="button"
@@ -1936,13 +1941,8 @@ export default function PhotoboothPage() {
                     </button>
                     <button
                       type="button"
-                      disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
                       onClick={() => goToStep(3)}
-                      className={`flex-1 py-2.5 px-3 font-bold text-xs rounded-xl flex items-center justify-center space-x-1 transition-all shadow-md whitespace-nowrap ${
-                        lobbyMode === 'multiplayer' && session?.creatorId !== playerId
-                          ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
-                          : 'bg-pink-500 hover:bg-pink-600 text-white shadow-pink-200'
-                      }`}
+                      className="flex-1 py-2.5 px-3 bg-pink-500 hover:bg-pink-600 text-white font-bold text-xs rounded-xl flex items-center justify-center space-x-1 transition-all shadow-md shadow-pink-200 whitespace-nowrap"
                     >
                       <span>Masuk Studio Foto</span>
                       <ChevronRight className="w-4 h-4 text-white" />
@@ -2373,12 +2373,11 @@ export default function PhotoboothPage() {
                           key={filter.id}
                           type="button"
                           onClick={() => handleUpdateConfig({ filterId: filter.id })}
-                          disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
                           className={`py-2 px-3 rounded-xl border text-xs text-left flex items-center justify-between transition-all whitespace-nowrap ${
                             activeConfig.filterId === filter.id
                               ? 'bg-pink-500 text-white border-pink-500 shadow-xs font-bold'
                               : 'bg-pink-50/30 border-pink-100 text-slate-700 hover:border-pink-300 hover:bg-pink-50/60'
-                          } ${lobbyMode === 'multiplayer' && session?.creatorId !== playerId ? 'opacity-70 cursor-not-allowed' : ''}`}
+                          }`}
                         >
                           <span className="font-semibold text-xs truncate">{filter.name}</span>
                           {activeConfig.filterId === filter.id && <Check className="w-3.5 h-3.5 text-white flex-shrink-0 ml-1" />}
@@ -2397,12 +2396,11 @@ export default function PhotoboothPage() {
                           key={overlay.id}
                           type="button"
                           onClick={() => handleUpdateConfig({ overlayId: overlay.id })}
-                          disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
                           className={`py-2 px-3 rounded-xl border text-left transition-all flex items-center justify-between whitespace-nowrap ${
                             activeConfig.overlayId === overlay.id
                               ? 'ring-2 ring-pink-500 border-pink-400 shadow-xs font-bold'
                               : 'border-pink-100 hover:border-pink-300'
-                          } ${lobbyMode === 'multiplayer' && session?.creatorId !== playerId ? 'opacity-70 cursor-not-allowed' : ''}`}
+                          }`}
                           style={{ backgroundColor: overlay.bg }}
                         >
                           <span className="text-xs font-bold truncate" style={{ color: overlay.text }}>{overlay.name}</span>
