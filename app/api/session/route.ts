@@ -51,13 +51,11 @@ export async function POST(req: NextRequest) {
       if (!id || !playerId) {
         return NextResponse.json({ error: 'Session ID and Player ID are required' }, { status: 400 });
       }
-      const session = joinSession(id, playerName || 'Player 2', playerId);
-      if (!session) {
-        return NextResponse.json({ 
-          error: 'Room penuh atau tidak ditemukan. Jika room baru saja ditinggalkan, tunggu 20 detik untuk otomatis reset, atau gunakan kode room lain.' 
-        }, { status: 404 });
+      const result = joinSession(id, playerName || 'Player 2', playerId);
+      if (!result.success) {
+        return NextResponse.json({ error: result.error }, { status: 400 });
       }
-      return NextResponse.json(session);
+      return NextResponse.json(result.session);
     }
 
     if (action === 'ready') {

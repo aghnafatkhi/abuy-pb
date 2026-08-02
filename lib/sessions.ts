@@ -113,12 +113,14 @@ export function createSession(creatorName: string, creatorId: string): Session {
   return newSession;
 }
 
-export function joinSession(id: string, playerName: string, playerId: string): Session | null {
+export function joinSession(id: string, playerName: string, playerId: string): { success: boolean; session?: Session; error?: string } {
   const sessions = loadSessions();
   const roomCode = id.toUpperCase();
   const session = sessions[roomCode];
   
-  if (!session) return null;
+  if (!session) {
+    return { success: false, error: `Room "${roomCode}" tidak ditemukan. Pastikan kode room sudah benar.` };
+  }
 
   const now = Date.now();
 
@@ -139,8 +141,11 @@ export function joinSession(id: string, playerName: string, playerId: string): S
     const activePlayers = Object.values(session.players).filter(p => p.active && now - p.lastSeen < 20000);
     
     if (activePlayers.length >= 2) {
-      // Game truly full with 2 active players
-      return null;
+      const playerNames = activePlayers.map(p => p.name).join(' & ');
+      return { 
+        success: false, 
+        error: `Room penuh. Sudah ada 2 pemain aktif (${playerNames}) di dalam room ini.` 
+      };
     }
     
     const playerCount = Object.keys(session.players).length;
@@ -157,7 +162,7 @@ export function joinSession(id: string, playerName: string, playerId: string): S
 
   session.updatedAt = now;
   saveSessions(sessions);
-  return session;
+  return { success: true, session };
 }
 
 export function updateSession(id: string, updater: (session: Session) => void): Session | null {
