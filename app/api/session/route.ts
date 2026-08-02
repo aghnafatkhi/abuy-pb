@@ -53,7 +53,9 @@ export async function POST(req: NextRequest) {
       }
       const session = joinSession(id, playerName || 'Player 2', playerId);
       if (!session) {
-        return NextResponse.json({ error: 'Session not found or already full' }, { status: 404 });
+        return NextResponse.json({ 
+          error: 'Room penuh atau tidak ditemukan. Jika room baru saja ditinggalkan, tunggu 20 detik untuk otomatis reset, atau gunakan kode room lain.' 
+        }, { status: 404 });
       }
       return NextResponse.json(session);
     }
@@ -96,7 +98,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'update_config') {
-      const { id, mode, memeId, overlayId, filterId } = body;
+      const { id, mode, memeId, overlayId, filterId, step } = body;
       if (!id) {
         return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
       }
@@ -106,6 +108,7 @@ export async function POST(req: NextRequest) {
         if (memeId !== undefined) session.memeId = memeId;
         if (overlayId !== undefined) session.overlayId = overlayId;
         if (filterId !== undefined) session.filterId = filterId;
+        if (step !== undefined) session.step = step;
       });
 
       if (!updated) {

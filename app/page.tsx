@@ -49,6 +49,8 @@ interface Player {
 interface Session {
   id: string;
   status: 'waiting' | 'countdown' | 'taking' | 'finished';
+  step: number;
+  creatorId: string;
   mode: 'freestyle' | 'meme';
   memeId: string;
   overlayId: string;
@@ -201,6 +203,8 @@ export default function PhotoboothPage() {
   const [soloSession, setSoloSession] = useState<Session>({
     id: '',
     status: 'waiting',
+    step: 1,
+    creatorId: '',
     mode: 'freestyle',
     memeId: 'pikachu',
     overlayId: 'classic-white',
@@ -239,6 +243,11 @@ export default function PhotoboothPage() {
     }
     setStep(targetStep);
     setMaxReachedStep(prev => Math.max(prev, targetStep));
+
+    // Sync step to multiplayer server if we are the room creator
+    if (lobbyMode === 'multiplayer' && roomCode && session?.creatorId === playerId) {
+      handleUpdateConfig({ step: targetStep });
+    }
   };
 
   useEffect(() => {
@@ -419,7 +428,7 @@ export default function PhotoboothPage() {
     cameraActiveRef.current = cameraActive;
   }, [cameraActive]);
 
-  // Initialize Player ID
+  // Initialize Player ID & Check URL Join Param
   useEffect(() => {
     const timer = setTimeout(() => {
       let id = localStorage.getItem('photobooth_player_id');
@@ -431,6 +440,16 @@ export default function PhotoboothPage() {
 
       const savedName = localStorage.getItem('photobooth_player_name') || `User-${id.slice(-4)}`;
       setPlayerName(savedName);
+
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        const joinCode = params.get('join');
+        if (joinCode) {
+          const formattedCode = joinCode.trim().toUpperCase();
+          setRoomIdInput(formattedCode);
+          setLobbyMode('multiplayer');
+        }
+      }
     }, 0);
     return () => clearTimeout(timer);
   }, []);
@@ -678,6 +697,12 @@ export default function PhotoboothPage() {
         if (active && !data.error) {
           setSession(data);
           
+          // Sync step from server in multiplayer mode
+          if (data.step && data.step !== step) {
+            setStep(data.step as any);
+            setMaxReachedStep(prev => Math.max(prev, data.step));
+          }
+
           // Auto-start camera if in booth state and camera is not active
           if (data.status !== 'finished' && view === 'booth' && !cameraActive) {
             startCamera();
@@ -1121,28 +1146,35 @@ export default function PhotoboothPage() {
     }
   };
 
-  // Sync Layout Options to Multiplayer server
-  const handleUpdateConfig = async (configUpdate: { mode?: 'freestyle' | 'meme', memeId?: string, overlayId?: string, filterId?: string }) => {
-    if (lobbyMode === 'solo') {
-      setSoloSession(prev => ({
-        ...prev,
-        ...configUpdate
-      }));
-    } else {
+  // Sync Layout Options to Multiplayer server & optimistic local state
+  const handleUpdateConfig = async (configUpdate: { mode?: 'freestyle' | 'meme', memeId?: string, overlayId?: string, filterId?: string, step?: number }) => {
+    // 1. Immediate optimistic local update for responsive UI feedback
+    setSoloSession(prev => ({
+      ...prev,
+      ...configUpdate
+    }));
+    setSession(prev => prev ? ({
+      ...prev,
+      ...configUpdate
+    }) : prev);
+
+    // 2. Sync to online room server if in multiplayer mode
+    const targetCode = roomCode || session?.id;
+    if (lobbyMode === 'multiplayer' && targetCode) {
       try {
         const res = await fetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             action: 'update_config',
-            id: roomCode,
+            id: targetCode,
             ...configUpdate
           })
         });
         const updated = await res.json();
         if (!updated.error) setSession(updated);
       } catch (err) {
-        console.error(err);
+        console.error('Failed to sync online config:', err);
       }
     }
   };
@@ -1192,15 +1224,20 @@ export default function PhotoboothPage() {
   };
 
   // Join real-time Multiplayer Room
-  const handleJoinRoom = async () => {
-    if (!roomIdInput.trim()) return;
+  const handleJoinRoom = async (codeOverride?: string | React.MouseEvent) => {
+    const rawCode = (typeof codeOverride === 'string' ? codeOverride : roomIdInput) || '';
+    const code = rawCode.trim().toUpperCase();
+    if (!code) {
+      alert('Masukkan Kode Room 4 karakter untuk bergabung.');
+      return;
+    }
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'join',
-          id: roomIdInput.trim().toUpperCase(),
+          id: code,
           playerName,
           playerId
         })
@@ -1209,12 +1246,18 @@ export default function PhotoboothPage() {
       if (data.error) {
         alert(data.error);
       } else {
+        setLobbyMode('multiplayer');
         setRoomCode(data.id);
         setSession(data);
         setStep(2);
+        // Clear join param from URL
+        if (typeof window !== 'undefined') {
+          window.history.replaceState({}, '', window.location.pathname);
+        }
       }
     } catch (err) {
       console.error(err);
+      alert('Gagal terhubung ke server room.');
     }
   };
 
@@ -1317,7 +1360,7 @@ export default function PhotoboothPage() {
     };
 
     compileImages();
-  }, [view, session, soloSession, lobbyMode]);
+  }, [view, session, soloSession, lobbyMode, step]);
 
   // Live Photo Burst hover loop player
   const startLivePhotoPlayback = (idx: number) => {
@@ -1580,6 +1623,8 @@ export default function PhotoboothPage() {
       setSoloSession({
         id: '',
         status: 'waiting',
+        step: 1,
+        creatorId: '',
         mode: 'freestyle',
         memeId: 'pikachu',
         overlayId: 'classic-white',
@@ -1778,14 +1823,14 @@ export default function PhotoboothPage() {
                     <input
                       type="text"
                       value={roomIdInput}
-                      onChange={(e) => setRoomIdInput(e.target.value)}
+                      onChange={(e) => setRoomIdInput(e.target.value.toUpperCase())}
                       maxLength={4}
                       placeholder="KODE ROOM"
                       className="flex-1 px-3 py-2 bg-pink-50/40 border border-pink-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-pink-400 text-center text-xs font-mono font-bold uppercase text-slate-800 tracking-widest"
                     />
                     <button
                       type="button"
-                      onClick={handleJoinRoom}
+                      onClick={() => handleJoinRoom()}
                       className="px-4 py-2 bg-pink-100 hover:bg-pink-200 text-pink-700 text-xs font-bold rounded-xl transition-all border border-pink-200 whitespace-nowrap"
                     >
                       Gabung Room
@@ -1839,7 +1884,14 @@ export default function PhotoboothPage() {
               {/* Right Column: Frame Controls */}
               <div className="lg:w-1/2 flex flex-col justify-between space-y-4">
                 <div>
-                  <h3 className="text-base font-bold text-slate-800 mb-0.5">Pilih Warna Frame</h3>
+                  <div className="flex items-center justify-between mb-0.5">
+                    <h3 className="text-base font-bold text-slate-800">Pilih Warna Frame</h3>
+                    {lobbyMode === 'multiplayer' && session?.creatorId === playerId && (
+                      <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-[10px] font-bold rounded-full border border-amber-200">
+                        ADMIN ROOM
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-slate-500 mb-3">Pilih tema warna bingkai foto aesthetic sebelum mengambil gambar.</p>
                   
                   <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
@@ -1848,11 +1900,12 @@ export default function PhotoboothPage() {
                         key={overlay.id}
                         type="button"
                         onClick={() => handleUpdateConfig({ overlayId: overlay.id })}
+                        disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
                         className={`py-2 px-3 rounded-xl border text-left transition-all flex items-center justify-between whitespace-nowrap ${
                           activeConfig.overlayId === overlay.id
                             ? 'ring-2 ring-pink-500 border-pink-400 shadow-xs font-bold'
                             : 'border-pink-100 hover:border-pink-300'
-                        }`}
+                        } ${lobbyMode === 'multiplayer' && session?.creatorId !== playerId ? 'opacity-70 cursor-not-allowed' : ''}`}
                         style={{ backgroundColor: overlay.bg }}
                       >
                         <span className="text-xs font-bold truncate" style={{ color: overlay.text }}>{overlay.name}</span>
@@ -1865,23 +1918,36 @@ export default function PhotoboothPage() {
                 </div>
 
                 {/* Step Actions */}
-                <div className="flex items-center space-x-2 pt-2 border-t border-pink-100">
-                  <button
-                    type="button"
-                    onClick={() => goToStep(1)}
-                    className="flex-1 py-2.5 px-3 bg-pink-50 hover:bg-pink-100 text-pink-700 font-semibold text-xs rounded-xl flex items-center justify-center space-x-1 border border-pink-200 transition-all whitespace-nowrap"
-                  >
-                    <ChevronLeft className="w-4 h-4" />
-                    <span>Kembali</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => goToStep(3)}
-                    className="flex-1 py-2.5 px-3 bg-pink-500 hover:bg-pink-600 text-white font-bold text-xs rounded-xl flex items-center justify-center space-x-1 transition-all shadow-md shadow-pink-200 whitespace-nowrap"
-                  >
-                    <span>Masuk Studio Foto</span>
-                    <ChevronRight className="w-4 h-4 text-white" />
-                  </button>
+                <div className="flex flex-col space-y-2 pt-2 border-t border-pink-100">
+                  {lobbyMode === 'multiplayer' && session?.creatorId !== playerId && (
+                    <p className="text-[10px] text-center text-pink-600 font-medium mb-1 italic">
+                      Hanya Pembuat Room yang bisa memilih frame dan memulai sesi.
+                    </p>
+                  )}
+                  
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={() => goToStep(1)}
+                      className="flex-1 py-2.5 px-3 bg-pink-50 hover:bg-pink-100 text-pink-700 font-semibold text-xs rounded-xl flex items-center justify-center space-x-1 border border-pink-200 transition-all whitespace-nowrap"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                      <span>Kembali</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
+                      onClick={() => goToStep(3)}
+                      className={`flex-1 py-2.5 px-3 font-bold text-xs rounded-xl flex items-center justify-center space-x-1 transition-all shadow-md whitespace-nowrap ${
+                        lobbyMode === 'multiplayer' && session?.creatorId !== playerId
+                          ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
+                          : 'bg-pink-500 hover:bg-pink-600 text-white shadow-pink-200'
+                      }`}
+                    >
+                      <span>Masuk Studio Foto</span>
+                      <ChevronRight className="w-4 h-4 text-white" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </motion.div>
@@ -2294,28 +2360,58 @@ export default function PhotoboothPage() {
                 )}
               </div>
 
-              {/* Right Column: Aesthetic Filter Selector Grid */}
+              {/* Right Column: Aesthetic Filter & Frame Selector */}
               <div className="lg:w-1/2 flex flex-col justify-between space-y-4">
-                <div>
-                  <h3 className="text-base font-bold text-slate-800 mb-0.5">Pilih Filter Aesthetic</h3>
-                  <p className="text-xs text-slate-500 mb-3">Pilih filter terbaik untuk mempercantik foto strip kamu.</p>
+                <div className="space-y-4 overflow-y-auto max-h-[360px] pr-1">
+                  <div>
+                    <h3 className="text-base font-bold text-slate-800 mb-0.5">Pilih Filter Aesthetic</h3>
+                    <p className="text-xs text-slate-500 mb-2">Pilih filter terbaik untuk mempercantik foto strip kamu.</p>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4 max-h-[280px] overflow-y-auto pr-1">
-                    {FILTERS.map((filter) => (
-                      <button
-                        key={filter.id}
-                        type="button"
-                        onClick={() => handleUpdateConfig({ filterId: filter.id })}
-                        className={`py-2 px-3 rounded-xl border text-xs text-left flex items-center justify-between transition-all whitespace-nowrap ${
-                          activeConfig.filterId === filter.id
-                            ? 'bg-pink-500 text-white border-pink-500 shadow-xs font-bold'
-                            : 'bg-pink-50/30 border-pink-100 text-slate-700 hover:border-pink-300 hover:bg-pink-50/60'
-                        }`}
-                      >
-                        <span className="font-semibold text-xs truncate">{filter.name}</span>
-                        {activeConfig.filterId === filter.id && <Check className="w-3.5 h-3.5 text-white flex-shrink-0 ml-1" />}
-                      </button>
-                    ))}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {FILTERS.map((filter) => (
+                        <button
+                          key={filter.id}
+                          type="button"
+                          onClick={() => handleUpdateConfig({ filterId: filter.id })}
+                          disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
+                          className={`py-2 px-3 rounded-xl border text-xs text-left flex items-center justify-between transition-all whitespace-nowrap ${
+                            activeConfig.filterId === filter.id
+                              ? 'bg-pink-500 text-white border-pink-500 shadow-xs font-bold'
+                              : 'bg-pink-50/30 border-pink-100 text-slate-700 hover:border-pink-300 hover:bg-pink-50/60'
+                          } ${lobbyMode === 'multiplayer' && session?.creatorId !== playerId ? 'opacity-70 cursor-not-allowed' : ''}`}
+                        >
+                          <span className="font-semibold text-xs truncate">{filter.name}</span>
+                          {activeConfig.filterId === filter.id && <Check className="w-3.5 h-3.5 text-white flex-shrink-0 ml-1" />}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-800 mb-0.5">Pilih Warna Frame</h3>
+                    <p className="text-xs text-slate-500 mb-2">Ubah warna bingkai foto sesuai selera.</p>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {OVERLAYS.map((overlay) => (
+                        <button
+                          key={overlay.id}
+                          type="button"
+                          onClick={() => handleUpdateConfig({ overlayId: overlay.id })}
+                          disabled={lobbyMode === 'multiplayer' && session?.creatorId !== playerId}
+                          className={`py-2 px-3 rounded-xl border text-left transition-all flex items-center justify-between whitespace-nowrap ${
+                            activeConfig.overlayId === overlay.id
+                              ? 'ring-2 ring-pink-500 border-pink-400 shadow-xs font-bold'
+                              : 'border-pink-100 hover:border-pink-300'
+                          } ${lobbyMode === 'multiplayer' && session?.creatorId !== playerId ? 'opacity-70 cursor-not-allowed' : ''}`}
+                          style={{ backgroundColor: overlay.bg }}
+                        >
+                          <span className="text-xs font-bold truncate" style={{ color: overlay.text }}>{overlay.name}</span>
+                          {activeConfig.overlayId === overlay.id && (
+                            <Check className="w-3.5 h-3.5 flex-shrink-0 ml-1" style={{ color: overlay.text }} />
+                          )}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
 

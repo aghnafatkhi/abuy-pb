@@ -14,6 +14,8 @@ export interface Player {
 export interface Session {
   id: string; // 4-letter room code
   status: 'waiting' | 'countdown' | 'taking' | 'finished';
+  step: number; // Current active step (1-5)
+  creatorId: string; // ID of the player who created the room
   mode: 'freestyle' | 'meme';
   memeId: string;
   overlayId: string;
@@ -85,6 +87,8 @@ export function createSession(creatorName: string, creatorId: string): Session {
   const newSession: Session = {
     id,
     status: 'waiting',
+    step: 1,
+    creatorId,
     mode: 'freestyle',
     memeId: 'pikachu',
     overlayId: 'classic-white',
@@ -116,19 +120,30 @@ export function joinSession(id: string, playerName: string, playerId: string): S
   
   if (!session) return null;
 
-  // If player already in session, update name
+  const now = Date.now();
+
+  // If player already in session, update name & lastSeen
   if (session.players[playerId]) {
     session.players[playerId].name = playerName || session.players[playerId].name;
     session.players[playerId].active = true;
-    session.players[playerId].lastSeen = Date.now();
+    session.players[playerId].lastSeen = now;
   } else {
-    // Check player count
-    const playerCount = Object.keys(session.players).length;
-    if (playerCount >= 2) {
-      // Game already full
+    // Prune stale/inactive players who haven't sent a heartbeat in 20 seconds
+    for (const [pId, p] of Object.entries(session.players)) {
+      if (!p.active || now - p.lastSeen > 20000) {
+        delete session.players[pId];
+      }
+    }
+
+    // Check active players count
+    const activePlayers = Object.values(session.players).filter(p => p.active && now - p.lastSeen < 20000);
+    
+    if (activePlayers.length >= 2) {
+      // Game truly full with 2 active players
       return null;
     }
     
+    const playerCount = Object.keys(session.players).length;
     session.players[playerId] = {
       id: playerId,
       name: playerName || `Player ${playerCount + 1}`,
@@ -136,11 +151,11 @@ export function joinSession(id: string, playerName: string, playerId: string): S
       active: true,
       photos: {},
       livePhotos: {},
-      lastSeen: Date.now()
+      lastSeen: now
     };
   }
 
-  session.updatedAt = Date.now();
+  session.updatedAt = now;
   saveSessions(sessions);
   return session;
 }
