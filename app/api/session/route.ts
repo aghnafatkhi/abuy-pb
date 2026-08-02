@@ -15,14 +15,14 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
   }
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
   // Periodic cleanup of expired sessions
   if (Math.random() < 0.1) {
-    cleanExpiredSessions();
+    await cleanExpiredSessions();
   }
 
   return NextResponse.json(session);
@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
       if (!creatorId) {
         return NextResponse.json({ error: 'Creator ID is required' }, { status: 400 });
       }
-      const session = createSession(creatorName || 'Player 1', creatorId);
+      const session = await createSession(creatorName || 'Player 1', creatorId);
       return NextResponse.json(session);
     }
 
@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
       if (!id || !playerId) {
         return NextResponse.json({ error: 'Session ID and Player ID are required' }, { status: 400 });
       }
-      const result = joinSession(id, playerName || 'Player 2', playerId);
+      const result = await joinSession(id, playerName || 'Player 2', playerId);
       if (!result.success) {
         return NextResponse.json({ error: result.error }, { status: 400 });
       }
@@ -64,7 +64,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Session ID and Player ID are required' }, { status: 400 });
       }
 
-      const updated = updateSession(id, (session) => {
+      const updated = await updateSession(id, (session) => {
         if (session.players[playerId]) {
           session.players[playerId].isReady = isReady !== undefined ? !!isReady : true;
         }
@@ -101,7 +101,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
       }
 
-      const updated = updateSession(id, (session) => {
+      const updated = await updateSession(id, (session) => {
         if (mode !== undefined) session.mode = mode;
         if (memeId !== undefined) session.memeId = memeId;
         if (overlayId !== undefined) session.overlayId = overlayId;
@@ -121,7 +121,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Session ID, Player ID, index, and photo are required' }, { status: 400 });
       }
 
-      const updated = updateSession(id, (session) => {
+      const updated = await updateSession(id, (session) => {
         const player = session.players[playerId];
         if (player) {
           player.photos[index] = photo;
@@ -177,7 +177,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Session ID and index are required' }, { status: 400 });
       }
 
-      const updated = updateSession(id, (session) => {
+      const updated = await updateSession(id, (session) => {
         session.status = 'countdown';
         session.currentPhotoIndex = index;
         session.countdownStartAt = Date.now() + 1000;
@@ -201,7 +201,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
       }
 
-      const updated = updateSession(id, (session) => {
+      const updated = await updateSession(id, (session) => {
         session.status = 'waiting';
         session.currentPhotoIndex = 0;
         session.countdownStartAt = undefined;
@@ -224,7 +224,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Session ID and Player ID are required' }, { status: 400 });
       }
 
-      const updated = updateSession(id, (session) => {
+      const updated = await updateSession(id, (session) => {
         const player = session.players[playerId];
         if (player) {
           player.lastSeen = Date.now();
