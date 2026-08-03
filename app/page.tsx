@@ -31,7 +31,9 @@ import {
   ChevronLeft,
   XCircle,
   StopCircle,
-  Lock
+  Lock,
+  AlertTriangle,
+  ArrowRight
 } from 'lucide-react';
 import { draw2RStrip, draw4RLayout } from '@/lib/draw-booth';
 import { doc, onSnapshot } from 'firebase/firestore';
@@ -225,6 +227,50 @@ export default function PhotoboothPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [clockOffset, setClockOffset] = useState<number>(0);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [quotaExceeded, setQuotaExceeded] = useState<boolean>(false);
+
+  // A wrapper around fetch to automatically detect and handle Firestore Quota limits
+  const safeFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    try {
+      const res = await fetch(input, init);
+      // Clone response to read text if it fails or has an error
+      const clone = res.clone();
+      try {
+        const text = await clone.text();
+        if (text) {
+          const lowerText = text.toLowerCase();
+          if (lowerText.includes('quota') || lowerText.includes('exhausted') || lowerText.includes('limit') || lowerText.includes('billing')) {
+            setQuotaExceeded(true);
+          }
+          try {
+            const data = JSON.parse(text);
+            if (data && data.error) {
+              const lowerErr = String(data.error).toLowerCase();
+              if (lowerErr.includes('quota') || lowerErr.includes('exhausted') || lowerErr.includes('limit') || lowerErr.includes('billing')) {
+                setQuotaExceeded(true);
+              }
+            }
+          } catch (_) {}
+        }
+      } catch (_) {}
+      return res;
+    } catch (err) {
+      const errMsg = String(err).toLowerCase();
+      if (errMsg.includes('quota') || errMsg.includes('exhausted') || errMsg.includes('limit') || errMsg.includes('billing')) {
+        setQuotaExceeded(true);
+      }
+      throw err;
+    }
+  };
+
+  const handleSwitchToSoloMode = () => {
+    stopCamera();
+    setLobbyMode('solo');
+    setRoomCode('');
+    setSession(null);
+    setStep(1);
+    setView('lobby');
+  };
   
   // Local sequence states for continuous automated photo shoot
   const [localShootActive, setLocalShootActive] = useState<boolean>(false);
@@ -752,7 +798,7 @@ export default function PhotoboothPage() {
     const measureClockOffset = async () => {
       try {
         const clientSentTime = Date.now();
-        const res = await fetch(`/api/session?id=${roomCode}`);
+        const res = await safeFetch(`/api/session?id=${roomCode}`);
         if (!res.ok) return;
         const clientRecvTime = Date.now();
         const data = await res.json();
@@ -792,6 +838,10 @@ export default function PhotoboothPage() {
         }
       }, (err: any) => {
         console.error('Firestore real-time subscription error:', err);
+        const errMsg = err?.message || String(err);
+        if (errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('exhausted') || errMsg.toLowerCase().includes('limit') || errMsg.toLowerCase().includes('billing')) {
+          setQuotaExceeded(true);
+        }
       });
     } catch (e) {
       console.error('Failed to initialize Firestore listener:', e);
@@ -801,7 +851,7 @@ export default function PhotoboothPage() {
     const heartbeatInterval = setInterval(async () => {
       if (!active) return;
       try {
-        await fetch('/api/session', {
+        await safeFetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1141,7 +1191,7 @@ export default function PhotoboothPage() {
       setIsUploading(true);
       isUploadingRef.current = true;
 
-      fetch('/api/session', {
+      safeFetch('/api/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1258,10 +1308,12 @@ export default function PhotoboothPage() {
   useEffect(() => {
     if (lobbyMode === 'multiplayer' && session && (session.status === 'countdown' || session.status === 'taking')) {
       if (step !== 3) {
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        setStep(3);
-        setView('booth');
-        startCamera();
+        const timer = setTimeout(() => {
+          setStep(3);
+          setView('booth');
+          startCamera();
+        }, 0);
+        return () => clearTimeout(timer);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1289,7 +1341,7 @@ export default function PhotoboothPage() {
       startCamera();
     } else if (roomCode) {
       try {
-        const res = await fetch('/api/session', {
+        const res = await safeFetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1333,7 +1385,7 @@ export default function PhotoboothPage() {
       startCamera();
     } else if (roomCode) {
       try {
-        const res = await fetch('/api/session', {
+        const res = await safeFetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1370,7 +1422,7 @@ export default function PhotoboothPage() {
     const targetCode = roomCode || session?.id;
     if (lobbyMode === 'multiplayer' && targetCode) {
       try {
-        const res = await fetch('/api/session', {
+        const res = await safeFetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1416,7 +1468,7 @@ export default function PhotoboothPage() {
     });
 
     try {
-      const res = await fetch('/api/session', {
+      const res = await safeFetch('/api/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1485,7 +1537,7 @@ export default function PhotoboothPage() {
     }
 
     try {
-      const res = await fetch('/api/session', {
+      const res = await safeFetch('/api/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1533,7 +1585,7 @@ export default function PhotoboothPage() {
     }
 
     try {
-      const res = await fetch('/api/session', {
+      const res = await safeFetch('/api/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1866,7 +1918,7 @@ export default function PhotoboothPage() {
       }, 500);
     } else {
       try {
-        const res = await fetch('/api/session', {
+        const res = await safeFetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1949,7 +2001,7 @@ export default function PhotoboothPage() {
       startCamera();
     } else {
       try {
-        await fetch('/api/session', {
+        await safeFetch('/api/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2012,6 +2064,34 @@ export default function PhotoboothPage() {
           )}
         </div>
       </header>
+
+      {/* Quota Exceeded Warn Banner */}
+      {quotaExceeded && (
+        <div className="bg-rose-50 border-b border-rose-100 px-4 py-3 sm:px-6 flex flex-col md:flex-row items-center justify-between gap-3 shadow-inner">
+          <div className="flex items-start md:items-center space-x-3">
+            <div className="p-1.5 bg-rose-100 text-rose-700 rounded-lg flex-shrink-0">
+              <AlertTriangle className="w-5 h-5" />
+            </div>
+            <div>
+              <p className="text-xs font-bold text-rose-900 leading-tight">
+                Database Online Sedang Mengalami Hambatan (Kuota Harian Terlampaui)
+              </p>
+              <p className="text-[11px] text-rose-700 mt-0.5 leading-normal">
+                Layanan Firestore saat ini mencapai batas gratis. Kamu tetap bisa berfoto dengan seru menggunakan <strong className="font-semibold text-rose-800">Solo Booth (Offline Mode)</strong> secara penuh tanpa kendala!
+              </p>
+            </div>
+          </div>
+          {lobbyMode === 'multiplayer' && (
+            <button
+              onClick={handleSwitchToSoloMode}
+              className="flex items-center space-x-1.5 px-4 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-xs transition-all whitespace-nowrap cursor-pointer"
+            >
+              <span>Mulai Solo Booth</span>
+              <ArrowRight className="w-3.5 h-3.5 text-white" />
+            </button>
+          )}
+        </div>
+      )}
 
       {/* 2. Step Stepper Bar */}
       <nav className="sticky top-14 z-30 h-10 flex-shrink-0 bg-pink-50/90 backdrop-blur-md border-b border-pink-100 flex items-center justify-center px-2 w-full overflow-hidden">
