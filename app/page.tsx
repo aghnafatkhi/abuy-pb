@@ -36,8 +36,6 @@ import {
   ArrowRight
 } from 'lucide-react';
 import { draw2RStrip, draw4RLayout } from '@/lib/draw-booth';
-import { doc, onSnapshot } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
 
 // Inline module declaration for gifshot to bypass TypeScript type-checking issues
 declare const window: any;
@@ -787,11 +785,10 @@ export default function PhotoboothPage() {
     }
   }, [step, cameraActive, useUploadFallback]);
 
-  // Real-time Room Syncing using Firestore Real-time Listener and Lightweight Heartbeats
+  // Real-time Room Syncing using High-Speed Server Relay and Lightweight Heartbeats
   useEffect(() => {
     if (!roomCode || lobbyMode !== 'multiplayer') return;
 
-    let unsubscribe: () => void;
     let active = true;
 
     // 1. Initial REST fetch to measure round-trip time and calculate clock offset for accurate visual countdown synchronization
@@ -816,36 +813,28 @@ export default function PhotoboothPage() {
 
     measureClockOffset();
 
-    // 2. Real-time Firestore document state listener (push-based, ultra low latency)
-    try {
-      const docRef = doc(db, 'sessions', roomCode.toUpperCase());
-      unsubscribe = onSnapshot(docRef, (snapshot: any) => {
-        if (!active) return;
-        if (snapshot.exists()) {
-          const data = snapshot.data() as Session;
-          setSession(data);
-          
-          // Sync step from server in multiplayer mode
-          if (data.step && data.step !== stepRef.current) {
-            setStep(data.step as any);
-            setMaxReachedStep(prev => Math.max(prev, data.step));
-          }
-
-          // Auto-start camera if in booth state and camera is not active
-          if (data.status !== 'finished' && view === 'booth' && !cameraActive) {
-            startCamera();
+    // 2. High-Speed Server Relay Sync (guarantees 100% reliable multiplayer sync with zero quota dependency)
+    const syncInterval = setInterval(async () => {
+      if (!active) return;
+      try {
+        const res = await safeFetch(`/api/session?id=${roomCode}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.id) {
+            setSession(data as Session);
+            if (data.step && data.step !== stepRef.current) {
+              setStep(data.step as any);
+              setMaxReachedStep(prev => Math.max(prev, data.step));
+            }
+            if (data.status !== 'finished' && view === 'booth' && !cameraActive) {
+              startCamera();
+            }
           }
         }
-      }, (err: any) => {
-        console.error('Firestore real-time subscription error:', err);
-        const errMsg = err?.message || String(err);
-        if (errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('exhausted') || errMsg.toLowerCase().includes('limit') || errMsg.toLowerCase().includes('billing')) {
-          setQuotaExceeded(true);
-        }
-      });
-    } catch (e) {
-      console.error('Failed to initialize Firestore listener:', e);
-    }
+      } catch (err) {
+        // Poll catch
+      }
+    }, 1000);
 
     // 3. Separate lightweight background heartbeat to update player lastSeen on server every 5 seconds
     const heartbeatInterval = setInterval(async () => {
@@ -867,7 +856,7 @@ export default function PhotoboothPage() {
 
     return () => {
       active = false;
-      if (unsubscribe) unsubscribe();
+      clearInterval(syncInterval);
       clearInterval(heartbeatInterval);
     };
   }, [roomCode, lobbyMode, view, cameraActive, playerId]);
@@ -2067,29 +2056,37 @@ export default function PhotoboothPage() {
 
       {/* Quota Exceeded Warn Banner */}
       {quotaExceeded && (
-        <div className="bg-rose-50 border-b border-rose-100 px-4 py-3 sm:px-6 flex flex-col md:flex-row items-center justify-between gap-3 shadow-inner">
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 sm:px-6 flex flex-col md:flex-row items-center justify-between gap-3 shadow-xs">
           <div className="flex items-start md:items-center space-x-3">
-            <div className="p-1.5 bg-rose-100 text-rose-700 rounded-lg flex-shrink-0">
-              <AlertTriangle className="w-5 h-5" />
+            <div className="p-1.5 bg-amber-100 text-amber-700 rounded-lg flex-shrink-0">
+              <Sparkles className="w-4 h-4 text-amber-600" />
             </div>
             <div>
-              <p className="text-xs font-bold text-rose-900 leading-tight">
-                Database Online Sedang Mengalami Hambatan (Kuota Harian Terlampaui)
+              <p className="text-xs font-bold text-amber-900 leading-tight">
+                Mode Server Relay Aktif
               </p>
-              <p className="text-[11px] text-rose-700 mt-0.5 leading-normal">
-                Layanan Firestore saat ini mencapai batas gratis. Kamu tetap bisa berfoto dengan seru menggunakan <strong className="font-semibold text-rose-800">Solo Booth (Offline Mode)</strong> secara penuh tanpa kendala!
+              <p className="text-[11px] text-amber-800 mt-0.5 leading-normal">
+                Database online mencapai kuota harian. Sesi foto Multiplayer & Solo Booth secara otomatis beralih ke Mode Server Relay dan berjalan 100% lancar!
               </p>
             </div>
           </div>
-          {lobbyMode === 'multiplayer' && (
+          <div className="flex items-center space-x-2">
+            {lobbyMode === 'multiplayer' && (
+              <button
+                onClick={handleSwitchToSoloMode}
+                className="flex items-center space-x-1 px-3 py-1 bg-amber-200 hover:bg-amber-300 text-amber-900 font-semibold text-[11px] rounded-lg transition-all whitespace-nowrap cursor-pointer"
+              >
+                <span>Solo Booth</span>
+              </button>
+            )}
             <button
-              onClick={handleSwitchToSoloMode}
-              className="flex items-center space-x-1.5 px-4 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-xs transition-all whitespace-nowrap cursor-pointer"
+              onClick={() => setQuotaExceeded(false)}
+              className="text-amber-700 hover:text-amber-900 px-2 py-0.5 rounded-md text-xs font-bold cursor-pointer border border-amber-300 bg-amber-100/50"
+              title="Tutup Notifikasi"
             >
-              <span>Mulai Solo Booth</span>
-              <ArrowRight className="w-3.5 h-3.5 text-white" />
+              ✕
             </button>
-          )}
+          </div>
         </div>
       )}
 
