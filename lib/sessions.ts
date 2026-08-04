@@ -19,6 +19,7 @@ export interface Player {
   active: boolean;
   photos: { [index: number]: string }; // index 0..3 -> base64 image data
   livePhotos: { [index: number]: string[] }; // index 0..3 -> array of base64 burst frames
+  liveCam?: string; // low-res base64 frame for real-time video call camera preview
   lastSeen: number;
 }
 

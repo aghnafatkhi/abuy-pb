@@ -140,6 +140,8 @@ export async function POST(req: NextRequest) {
       const updated = await updateSession(id, (session) => {
         const player = session.players[playerId];
         if (player) {
+          if (!player.photos) player.photos = {};
+          if (!player.livePhotos) player.livePhotos = {};
           player.photos[index] = photo;
           if (livePhotos) {
             player.livePhotos[index] = livePhotos;
@@ -148,36 +150,30 @@ export async function POST(req: NextRequest) {
 
         // Check if all active players uploaded their photo for this index
         const players = Object.values(session.players).filter(p => p.active);
-        const allUploaded = players.every(p => p.photos[index] !== undefined);
+        const all4Complete = [0, 1, 2, 3].every(i => players.length > 0 && players.every(p => p.photos && p.photos[i] !== undefined));
 
-        if (allUploaded) {
-          // Check if ALL 4 photos (indexes 0, 1, 2, 3) are now present for all active players
-          const all4Complete = [0, 1, 2, 3].every(i => players.every(p => p.photos[i] !== undefined));
-
-          if (all4Complete) {
-            session.status = 'finished';
-            // Mark everyone as not ready for the next round
-            for (const pId of Object.keys(session.players)) {
-              session.players[pId].isReady = false;
-            }
-          } else {
-            // Find the next missing photo index starting after current index or loop
+        if (all4Complete) {
+          session.status = 'finished';
+          session.step = 4;
+          // Mark everyone as not ready for the next round
+          for (const pId of Object.keys(session.players)) {
+            session.players[pId].isReady = false;
+          }
+        } else {
+          const allUploadedThisIndex = players.every(p => p.photos && p.photos[index] !== undefined);
+          if (allUploadedThisIndex) {
             let nextIdx = index + 1;
-            while (nextIdx < 4 && players.every(p => p.photos[nextIdx] !== undefined)) {
+            while (nextIdx < 4 && players.every(p => p.photos && p.photos[nextIdx] !== undefined)) {
               nextIdx++;
             }
             if (nextIdx >= 4) {
-              // Find any remaining missing index from 0..3
-              nextIdx = [0, 1, 2, 3].find(i => !players.every(p => p.photos[i] !== undefined)) ?? 3;
+              nextIdx = [0, 1, 2, 3].find(i => !players.every(p => p.photos && p.photos[i] !== undefined)) ?? 3;
             }
 
             session.currentPhotoIndex = nextIdx;
             session.status = 'countdown';
-            session.countdownStartAt = Date.now() + 1000; // Trigger next countdown
+            session.countdownStartAt = Date.now() + 1000;
           }
-        } else {
-          // Still waiting for the other player's photo
-          session.status = 'taking';
         }
       });
 
@@ -246,7 +242,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'heartbeat') {
-      const { id, playerId } = body;
+      const { id, playerId, liveCam } = body;
       if (!id || !playerId) {
         return NextResponse.json({ error: 'Session ID and Player ID are required' }, { status: 400 });
       }
@@ -256,6 +252,9 @@ export async function POST(req: NextRequest) {
         if (player) {
           player.lastSeen = Date.now();
           player.active = true;
+          if (liveCam !== undefined) {
+            player.liveCam = liveCam;
+          }
         }
 
         // Mark players as inactive if no heartbeat in 45 seconds (handling blurred tabs and throttle)

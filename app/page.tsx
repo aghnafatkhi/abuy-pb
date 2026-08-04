@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Camera, 
@@ -47,6 +47,7 @@ interface Player {
   active: boolean;
   photos: { [index: number]: string };
   livePhotos: { [index: number]: string[] };
+  liveCam?: string;
 }
 
 interface Session {
@@ -310,17 +311,23 @@ export default function PhotoboothPage() {
   // Step-by-Step Workflow State (1: Profil, 2: Frame, 3: Booth, 4: Filter, 5: Download)
   const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
   const stepRef = useRef<number>(1);
+  const hasPlayedCompleteSoundRef = useRef<boolean>(false);
+  const pendingReadyStateRef = useRef<{ isReady: boolean; lockUntil: number } | null>(null);
+  const latestLiveCamRef = useRef<string>('');
+
   useEffect(() => {
     stepRef.current = step;
+    if (step < 4) {
+      hasPlayedCompleteSoundRef.current = false;
+    }
   }, [step]);
   const [maxReachedStep, setMaxReachedStep] = useState<number>(1);
 
   const goToStep = (targetStep: 1 | 2 | 3 | 4 | 5) => {
-    const currentStep = step as number;
-    if (targetStep === 3) {
+    if (targetStep === 2 || targetStep === 3) {
       setView('booth');
       startCamera();
-    } else if (currentStep === 3) {
+    } else if (targetStep === 1 || targetStep >= 4) {
       stopCamera();
     }
     if (targetStep === 1) {
@@ -474,14 +481,14 @@ export default function PhotoboothPage() {
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Callback ref to bind camera streams instantly on component mount/remount
-  const setVideoRef = (el: HTMLVideoElement | null) => {
+  // Callback ref to bind camera streams instantly on component mount/remount without pipeline resets
+  const setVideoRef = useCallback((el: HTMLVideoElement | null) => {
     videoRef.current = el;
-    if (el && streamRef.current) {
+    if (el && streamRef.current && el.srcObject !== streamRef.current) {
       el.srcObject = streamRef.current;
       el.play().catch(e => console.warn('Play video on mount error:', e));
     }
-  };
+  }, []);
 
   // Synchronization refs to avoid stale closure bugs in timers/callbacks
   const lobbyModeRef = useRef(lobbyMode);
@@ -736,6 +743,17 @@ export default function PhotoboothPage() {
   const startCamera = async () => {
     try {
       setCameraError('');
+      // Reuse existing active camera stream without restarting hardware
+      if (streamRef.current && streamRef.current.getVideoTracks().some(t => t.readyState === 'live' && t.enabled)) {
+        if (videoRef.current && videoRef.current.srcObject !== streamRef.current) {
+          videoRef.current.srcObject = streamRef.current;
+          videoRef.current.play().catch(e => console.warn('Play video error:', e));
+        }
+        setCameraActive(true);
+        setUseUploadFallback(false);
+        return;
+      }
+
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
@@ -745,12 +763,16 @@ export default function PhotoboothPage() {
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, facingMode: 'user' },
+        video: {
+          width: { ideal: 3840, min: 1920 },
+          height: { ideal: 2160, min: 1080 },
+          facingMode: 'user'
+        },
         audio: false
       });
       
       streamRef.current = stream;
-      if (videoRef.current) {
+      if (videoRef.current && videoRef.current.srcObject !== stream) {
         videoRef.current.srcObject = stream;
         videoRef.current.play().catch(e => console.warn('Play video error:', e));
       }
@@ -795,18 +817,18 @@ export default function PhotoboothPage() {
     }
   };
 
-  // Safely bind camera stream to video element when step is 3 or video element mounts
+  // Safely bind camera stream to video element when step is 2 or 3
   useEffect(() => {
-    if (step === 3) {
+    if (step === 2 || step === 3) {
       if (!streamRef.current && !useUploadFallback) {
         startCamera();
-      } else if (cameraActive && streamRef.current && videoRef.current) {
+      } else if (streamRef.current && videoRef.current && videoRef.current.srcObject !== streamRef.current) {
         videoRef.current.srcObject = streamRef.current;
         videoRef.current.play().catch((err) => {
           console.warn('Gagal memutar video:', err);
         });
       }
-    } else {
+    } else if (step >= 4) {
       if (isCapturingRef.current) {
         stopPhotoShoot();
       }
@@ -814,7 +836,26 @@ export default function PhotoboothPage() {
         stopCamera();
       }
     }
-  }, [step, cameraActive, useUploadFallback]);
+  }, [step, useUploadFallback]);
+
+  // Real-time canvas frame capture for partner video call feed
+  useEffect(() => {
+    if (!cameraActive || !roomCode || lobbyMode !== 'multiplayer') return;
+
+    const offscreenCanvas = document.createElement('canvas');
+    offscreenCanvas.width = 240;
+    offscreenCanvas.height = 180;
+    const offscreenCtx = offscreenCanvas.getContext('2d');
+
+    const interval = setInterval(() => {
+      if (videoRef.current && videoRef.current.readyState >= 2 && videoRef.current.videoWidth > 0 && offscreenCtx) {
+        offscreenCtx.drawImage(videoRef.current, 0, 0, 240, 180);
+        latestLiveCamRef.current = offscreenCanvas.toDataURL('image/jpeg', 0.45);
+      }
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, [cameraActive, roomCode, lobbyMode]);
 
   // Real-time Room Syncing using High-Speed Server Relay and Lightweight Heartbeats
   useEffect(() => {
@@ -852,12 +893,56 @@ export default function PhotoboothPage() {
         if (res.ok) {
           const data = await res.json();
           if (data && data.id) {
-            setSession(data as Session);
+            setSession(prev => {
+              if (!prev) return data as Session;
+              const mergedPlayers = { ...data.players };
+              for (const pid of Object.keys(prev.players)) {
+                if (mergedPlayers[pid]) {
+                  mergedPlayers[pid] = {
+                    ...mergedPlayers[pid],
+                    photos: {
+                      ...mergedPlayers[pid].photos,
+                      ...prev.players[pid]?.photos
+                    },
+                    livePhotos: {
+                      ...mergedPlayers[pid].livePhotos,
+                      ...prev.players[pid]?.livePhotos
+                    }
+                  };
+                } else {
+                  mergedPlayers[pid] = prev.players[pid];
+                }
+              }
+
+              // Apply optimistic readiness lock to prevent Ready button flickering
+              if (pendingReadyStateRef.current) {
+                if (Date.now() < pendingReadyStateRef.current.lockUntil) {
+                  if (mergedPlayers[playerId]) {
+                    mergedPlayers[playerId] = {
+                      ...mergedPlayers[playerId],
+                      isReady: pendingReadyStateRef.current.isReady
+                    };
+                  }
+                } else {
+                  pendingReadyStateRef.current = null;
+                }
+              }
+
+              return {
+                ...data,
+                players: mergedPlayers
+              } as Session;
+            });
+
             if (data.step && data.step !== stepRef.current) {
-              setStep(data.step as any);
-              setMaxReachedStep(prev => Math.max(prev, data.step));
+              const myPlayer = data.players[playerIdRef.current];
+              const hasTakenAll4 = myPlayer && [0, 1, 2, 3].every(i => myPlayer.photos && myPlayer.photos[i] !== undefined);
+              if (!hasTakenAll4 || data.step >= 4) {
+                setStep(data.step as any);
+                setMaxReachedStep(prev => Math.max(prev, data.step));
+              }
             }
-            if (data.status !== 'finished' && view === 'booth' && !cameraActive) {
+            if (data.status !== 'finished' && (stepRef.current === 2 || stepRef.current === 3) && !streamRef.current) {
               startCamera();
             }
           }
@@ -865,9 +950,9 @@ export default function PhotoboothPage() {
       } catch (err) {
         // Poll catch
       }
-    }, 1000);
+    }, 800);
 
-    // 3. Separate lightweight background heartbeat to update player lastSeen on server every 5 seconds
+    // 3. High-frequency background heartbeat to relay live video call camera frames & update lastSeen
     const heartbeatInterval = setInterval(async () => {
       if (!active) return;
       try {
@@ -877,20 +962,21 @@ export default function PhotoboothPage() {
           body: JSON.stringify({
             action: 'heartbeat',
             id: roomCode,
-            playerId
+            playerId,
+            liveCam: latestLiveCamRef.current
           })
         });
       } catch (err) {
-        console.warn('Heartbeat update failed:', err);
+        // Heartbeat catch
       }
-    }, 5000);
+    }, 800);
 
     return () => {
       active = false;
       clearInterval(syncInterval);
       clearInterval(heartbeatInterval);
     };
-  }, [roomCode, lobbyMode, view, cameraActive, playerId]);
+  }, [roomCode, lobbyMode, view, playerId]);
 
   // Capture Live Photo Burst logic
   const startBurstRecording = () => {
@@ -1076,16 +1162,10 @@ export default function PhotoboothPage() {
       capturedBurst = stopBurstRecording();
 
       const video = videoRef.current;
-      const vw = video?.videoWidth || 1280;
-      const vh = video?.videoHeight || 960;
-
-      // Exact target aspect ratio for photo slot
-      // Solo slot ratio = 340 / 250 = 1.36
-      // Online 2-Player half-slot ratio = 170 / 250 = 0.68
       const targetRatio = currentLobbyMode === 'multiplayer' ? (170 / 250) : (340 / 250);
 
-      // High resolution export canvas
-      const exportH = 1000;
+      // Ultra High resolution export canvas
+      const exportH = 1600;
       const exportW = Math.round(exportH * targetRatio);
 
       const canvas = document.createElement('canvas');
@@ -1098,8 +1178,10 @@ export default function PhotoboothPage() {
         return;
       }
       
-      if (video) {
-        // Perform exact centered object-cover crop matching the viewfinder feed
+      let hasDrawn = false;
+      if (video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
         const videoRatio = vw / vh;
         let sx = 0, sy = 0, sw = vw, sh = vh;
 
@@ -1112,8 +1194,27 @@ export default function PhotoboothPage() {
         }
 
         ctx.drawImage(video, sx, sy, sw, sh, 0, 0, exportW, exportH);
+        hasDrawn = true;
       }
-      mainPhotoUrl = canvas.toDataURL('image/jpeg', 0.95);
+
+      if (!hasDrawn && capturedBurst.length > 0) {
+        const lastFrame = capturedBurst[capturedBurst.length - 1];
+        const imgObj = new Image();
+        imgObj.src = lastFrame;
+        ctx.drawImage(imgObj, 0, 0, exportW, exportH);
+        hasDrawn = true;
+      }
+
+      if (!hasDrawn) {
+        ctx.fillStyle = '#fce7f3';
+        ctx.fillRect(0, 0, exportW, exportH);
+        ctx.fillStyle = '#db2777';
+        ctx.font = 'bold 28px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Foto Booth', exportW / 2, exportH / 2);
+      }
+
+      mainPhotoUrl = canvas.toDataURL('image/jpeg', 0.88);
     }
  
     // 2. Upload photo to local or server session using sync refs
@@ -1160,7 +1261,10 @@ export default function PhotoboothPage() {
             stopPhotoShoot();
             setStep(4);
             setView('gallery');
-            playSessionCompleteSound();
+            if (!hasPlayedCompleteSoundRef.current) {
+              hasPlayedCompleteSoundRef.current = true;
+              playSessionCompleteSound();
+            }
             stopCamera();
           }, 1500);
         }
@@ -1170,7 +1274,10 @@ export default function PhotoboothPage() {
           stopPhotoShoot();
           setStep(4);
           setView('gallery');
-          playSessionCompleteSound();
+          if (!hasPlayedCompleteSoundRef.current) {
+            hasPlayedCompleteSoundRef.current = true;
+            playSessionCompleteSound();
+          }
           stopCamera();
         }, 1500);
       }
@@ -1230,22 +1337,27 @@ export default function PhotoboothPage() {
         if (updated && !updated.error) {
           setSession(prev => {
             if (!prev) return updated;
-            return {
-              ...updated,
-              players: {
-                ...updated.players,
-                [currentPlayerId]: {
-                  ...updated.players[currentPlayerId],
+            const mergedPlayers = { ...updated.players };
+            for (const pid of Object.keys(prev.players)) {
+              if (mergedPlayers[pid]) {
+                mergedPlayers[pid] = {
+                  ...mergedPlayers[pid],
                   photos: {
-                    ...updated.players[currentPlayerId]?.photos,
-                    ...prev.players[currentPlayerId]?.photos
+                    ...mergedPlayers[pid].photos,
+                    ...prev.players[pid]?.photos
                   },
                   livePhotos: {
-                    ...updated.players[currentPlayerId]?.livePhotos,
-                    ...prev.players[currentPlayerId]?.livePhotos
+                    ...mergedPlayers[pid].livePhotos,
+                    ...prev.players[pid]?.livePhotos
                   }
-                }
+                };
+              } else {
+                mergedPlayers[pid] = prev.players[pid];
               }
+            }
+            return {
+              ...updated,
+              players: mergedPlayers
             };
           });
         }
@@ -1276,7 +1388,10 @@ export default function PhotoboothPage() {
             stopPhotoShoot();
             setStep(4);
             setView('gallery');
-            playSessionCompleteSound();
+            if (!hasPlayedCompleteSoundRef.current) {
+              hasPlayedCompleteSoundRef.current = true;
+              playSessionCompleteSound();
+            }
             stopCamera();
           }, 1500);
         }
@@ -1288,25 +1403,37 @@ export default function PhotoboothPage() {
     }
   };
 
-  // Auto switch to gallery when multiplayer session is finished
+  // Auto switch to gallery when multiplayer session is finished or when local player finished all 4 photos
   useEffect(() => {
-    if (lobbyMode === 'multiplayer' && session?.status === 'finished' && (view === 'booth' || step === 3)) {
-      const timer = setTimeout(() => {
-        setStep(4);
-        setView('gallery');
-        playSessionCompleteSound();
-        stopCamera();
-      }, 0);
-      return () => clearTimeout(timer);
+    if (lobbyMode === 'multiplayer' && session) {
+      const myPlayer = session.players[playerId];
+      const hasTakenAll4 = myPlayer && [0, 1, 2, 3].every(i => myPlayer.photos && myPlayer.photos[i] !== undefined);
+
+      if (session.status === 'finished' || hasTakenAll4) {
+        if (step === 3 || view === 'booth') {
+          const timer = setTimeout(() => {
+            setStep(4);
+            setView('gallery');
+            if (!hasPlayedCompleteSoundRef.current) {
+              hasPlayedCompleteSoundRef.current = true;
+              playSessionCompleteSound();
+            }
+            stopCamera();
+          }, 0);
+          return () => clearTimeout(timer);
+        }
+      }
     }
-  }, [session?.status, view, step, lobbyMode]);
+  }, [session, lobbyMode, view, step, playerId]);
 
   // Handle Multi-Player Countdown Sync with Clock Drift Adjustment
   useEffect(() => {
     if (lobbyMode !== 'multiplayer' || !session || session.status !== 'countdown' || !session.countdownStartAt) return;
 
-    // If local sequence photoshoot is already active, ignore any incoming server countdown triggers
+    // If local sequence photoshoot is already active or player has finished all 4 photos, ignore incoming server countdown
     if (localShootActiveRef.current) return;
+    const myPlayer = session.players[playerId];
+    if (myPlayer && [0, 1, 2, 3].every(i => myPlayer.photos && myPlayer.photos[i] !== undefined)) return;
 
     // eslint-disable-next-line react-hooks/purity
     const remaining = session.countdownStartAt - (Date.now() + clockOffset);
@@ -1322,12 +1449,15 @@ export default function PhotoboothPage() {
 
     return () => clearTimeout(triggerLocalCountdown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.status, session?.countdownStartAt, session?.currentPhotoIndex, clockOffset]);
+  }, [session?.status, session?.countdownStartAt, session?.currentPhotoIndex, clockOffset, playerId]);
 
   // Auto-navigate room players to Step 3 when countdown or taking is active
   useEffect(() => {
     if (lobbyMode === 'multiplayer' && session && (session.status === 'countdown' || session.status === 'taking')) {
-      if (step !== 3) {
+      const myPlayer = session.players[playerId];
+      const hasTakenAll4 = myPlayer && [0, 1, 2, 3].every(i => myPlayer.photos && myPlayer.photos[i] !== undefined);
+
+      if (!hasTakenAll4 && step !== 3) {
         const timer = setTimeout(() => {
           setStep(3);
           setView('booth');
@@ -1337,7 +1467,7 @@ export default function PhotoboothPage() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.status, lobbyMode, step]);
+  }, [session?.status, lobbyMode, step, playerId]);
 
   // Retake a specific photo frame index
   const handleRetakeSinglePhoto = async (index: number) => {
@@ -1470,6 +1600,12 @@ export default function PhotoboothPage() {
     
     const isCurrentlyReady = session?.players[playerId]?.isReady || false;
     const nextReadyState = !isCurrentlyReady;
+
+    // Set optimistic ready lock for 4 seconds so polling never flips button back
+    pendingReadyStateRef.current = {
+      isReady: nextReadyState,
+      lockUntil: Date.now() + 4000
+    };
 
     // Optimistic local state update to ensure 100% instant visual sync
     setSession(prev => {
@@ -2282,100 +2418,174 @@ export default function PhotoboothPage() {
             </motion.div>
           )}
 
-          {/* STEP 2: PILIH FRAME (SEBELUM FOTO) */}
+          {/* STEP 2: PILIH FRAME & LOBBY */}
           {step === 2 && (
             <motion.div
               key="step2"
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
-              className="w-full max-w-4xl bg-white border border-pink-100 rounded-3xl p-5 sm:p-6 shadow-xl shadow-pink-100/40 flex flex-col lg:flex-row gap-6 my-auto"
+              className="w-full max-w-3xl bg-white border border-pink-100 rounded-3xl p-4 sm:p-6 shadow-xl shadow-pink-100/40 flex flex-col space-y-4 my-auto"
             >
-              {/* Left Column: Visual Frame Preview */}
-              <div className="lg:w-1/2 flex flex-col items-center justify-center bg-pink-50/40 p-4 rounded-2xl border border-pink-100">
-                <p className="text-[11px] font-mono font-bold text-pink-600 uppercase mb-3">Preview Frame Strip</p>
-                
-                {/* Simulated 2R Strip Box */}
-                <div 
-                  className="w-36 p-2 rounded-xl shadow-lg flex flex-col items-center space-y-1.5 transition-colors duration-300 border border-pink-100"
-                  style={{ backgroundColor: OVERLAYS.find(o => o.id === activeConfig.overlayId)?.bg || '#ffffff' }}
-                >
-                  <p 
-                    className="text-[9px] font-bold uppercase tracking-wider text-center"
-                    style={{ color: OVERLAYS.find(o => o.id === activeConfig.overlayId)?.text || '#1e293b' }}
-                  >
-                    Photobooth Abuy
-                  </p>
-                  
-                  {[0, 1, 2, 3].map((idx) => (
-                    <div key={idx} className="w-full h-16 bg-pink-100/30 rounded-lg flex items-center justify-center border border-pink-200/40">
-                      <Camera className="w-4 h-4 text-pink-400" />
-                    </div>
-                  ))}
-
-                  <p 
-                    className="text-[8px] font-medium text-center opacity-80"
-                    style={{ color: OVERLAYS.find(o => o.id === activeConfig.overlayId)?.text || '#1e293b' }}
-                  >
-                    Dibuat untuk Ghina dari Aghna
-                  </p>
-                </div>
-              </div>
-
-              {/* Right Column: Frame Controls */}
-              <div className="lg:w-1/2 flex flex-col justify-between space-y-4">
-                <div>
-                  <div className="flex items-center justify-between mb-0.5">
-                    <h3 className="text-base font-bold text-slate-800">Pilih Warna Frame</h3>
-                    {lobbyMode === 'multiplayer' && (
-                      <span className="px-2 py-0.5 bg-pink-100 text-pink-700 text-[10px] font-bold rounded-full border border-pink-200 uppercase">
-                        Berbagi Frame
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-xs text-slate-500 mb-3">Pilih tema warna bingkai foto aesthetic sebelum mengambil gambar.</p>
-                  
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-4">
-                    {OVERLAYS.map((overlay) => (
-                      <button
-                        key={overlay.id}
-                        type="button"
-                        onClick={() => handleUpdateConfig({ overlayId: overlay.id })}
-                        className={`py-2 px-3 rounded-xl border text-left transition-all flex items-center justify-between whitespace-nowrap ${
-                          activeConfig.overlayId === overlay.id
-                            ? 'ring-2 ring-pink-500 border-pink-400 shadow-xs font-bold'
-                            : 'border-pink-100 hover:border-pink-300'
-                        }`}
-                        style={{ backgroundColor: overlay.bg }}
-                      >
-                        <span className="text-xs font-bold truncate" style={{ color: overlay.text }}>{overlay.name}</span>
-                        {activeConfig.overlayId === overlay.id && (
-                          <Check className="w-3.5 h-3.5 flex-shrink-0 ml-1" style={{ color: overlay.text }} />
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Step Actions */}
-                <div className="flex flex-col space-y-2 pt-2 border-t border-pink-100">
+              {/* Top Banner for Multiplayer */}
+              {lobbyMode === 'multiplayer' && (
+                <div className="flex items-center justify-between bg-pink-50/80 border border-pink-200/60 p-2.5 px-3.5 rounded-2xl">
                   <div className="flex items-center space-x-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="text-xs font-bold text-slate-800">Lobby Room Online</span>
+                    <span className="font-mono text-xs font-extrabold text-pink-600 bg-white px-2 py-0.5 rounded-lg border border-pink-200">
+                      {roomCode}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleCopyLink}
+                    className="px-2.5 py-1 bg-white hover:bg-pink-100/50 text-pink-700 text-[11px] font-bold rounded-xl border border-pink-200 flex items-center space-x-1 transition-all"
+                  >
+                    <Share2 className="w-3 h-3 text-pink-500" />
+                    <span className="hidden sm:inline">Salin Link</span>
+                  </button>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+                {/* Visual Viewfinder / Video Call in Step 2 */}
+                <div className="lg:col-span-6 flex flex-col items-center justify-center bg-pink-50/30 p-3 rounded-2xl border border-pink-100">
+                  {lobbyMode === 'multiplayer' ? (() => {
+                    const pKeys = session ? Object.keys(session.players) : [];
+                    const myP = session?.players[playerId];
+                    const partnerP = pKeys.map(k => session?.players[k]).find(p => p && p.id !== playerId);
+
+                    return (
+                      <div className="w-full space-y-2">
+                        <div className="grid grid-cols-2 gap-2 w-full">
+                          {/* My Live Cam */}
+                          <div className="relative aspect-[4/3] bg-pink-950/20 rounded-xl overflow-hidden border border-pink-300">
+                            <div className="absolute top-1.5 left-1.5 z-10 bg-slate-900/80 px-2 py-0.5 rounded-full text-[9px] font-bold text-white">
+                              {myP?.name || 'Kamu'}
+                            </div>
+                            <video
+                              ref={setVideoRef}
+                              autoPlay
+                              playsInline
+                              muted
+                              className="w-full h-full object-cover transform -scale-x-100"
+                            />
+                          </div>
+
+                          {/* Partner Live Cam */}
+                          <div className="relative aspect-[4/3] bg-pink-950/30 rounded-xl overflow-hidden border border-pink-300 flex items-center justify-center">
+                            {partnerP ? (
+                              <>
+                                <div className="absolute top-1.5 left-1.5 z-10 bg-slate-900/80 px-2 py-0.5 rounded-full text-[9px] font-bold text-white flex items-center space-x-1">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-ping" />
+                                  <span>{partnerP.name}</span>
+                                </div>
+                                {partnerP.liveCam ? (
+                                  <img
+                                    src={partnerP.liveCam}
+                                    alt={partnerP.name}
+                                    className="w-full h-full object-cover transform -scale-x-100"
+                                  />
+                                ) : (
+                                  <div className="text-center p-2 text-pink-200">
+                                    <Camera className="w-4 h-4 mx-auto mb-1 animate-pulse" />
+                                    <span className="text-[10px] font-bold block">Kamera {partnerP.name}...</span>
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <div className="text-center p-2 text-pink-200">
+                                <Users className="w-5 h-5 mx-auto mb-1 text-pink-300" />
+                                <span className="text-[10px] font-bold block">Menunggu Player 2</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Ready Button for Multiplayer */}
+                        <button
+                          type="button"
+                          onClick={handleToggleReady}
+                          className={`w-full py-2.5 px-3 rounded-xl font-extrabold text-xs flex items-center justify-center space-x-2 transition-all shadow-md ${
+                            myP?.isReady
+                              ? 'bg-emerald-500 hover:bg-emerald-600 text-white shadow-emerald-200'
+                              : 'bg-pink-500 hover:bg-pink-600 text-white shadow-pink-200'
+                          }`}
+                        >
+                          <Check className="w-4 h-4" />
+                          <span>{myP?.isReady ? '✓ KAMU SUDAH SIAP (KLIK BILA BATAL)' : 'SIAP FOTO (READY LOBBY)'}</span>
+                        </button>
+                      </div>
+                    );
+                  })() : (
+                    <div className="flex flex-col items-center">
+                      <p className="text-[11px] font-mono font-bold text-pink-600 uppercase mb-2">Preview Frame Strip</p>
+                      <div 
+                        className="w-28 p-2 rounded-xl shadow-md flex flex-col items-center space-y-1 transition-colors border border-pink-100"
+                        style={{ backgroundColor: OVERLAYS.find(o => o.id === activeConfig.overlayId)?.bg || '#ffffff' }}
+                      >
+                        <p className="text-[8px] font-bold uppercase text-center" style={{ color: OVERLAYS.find(o => o.id === activeConfig.overlayId)?.text || '#1e293b' }}>
+                          Photobooth Abuy
+                        </p>
+                        {[0, 1, 2, 3].map((idx) => (
+                          <div key={idx} className="w-full h-12 bg-pink-100/30 rounded-lg flex items-center justify-center border border-pink-200/40">
+                            <Camera className="w-3.5 h-3.5 text-pink-400" />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Right Column: Frame Picker & Navigation */}
+                <div className="lg:col-span-6 flex flex-col justify-between space-y-3">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-800 mb-0.5">Pilih Warna Bingkai</h3>
+                    <p className="text-[11px] text-slate-500 mb-2">Pilih tema bingkai foto untuk sesi photobooth.</p>
+                    
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                      {OVERLAYS.map((overlay) => (
+                        <button
+                          key={overlay.id}
+                          type="button"
+                          onClick={() => handleUpdateConfig({ overlayId: overlay.id })}
+                          className={`py-2 px-2.5 rounded-xl border text-left transition-all flex items-center justify-between whitespace-nowrap ${
+                            activeConfig.overlayId === overlay.id
+                              ? 'ring-2 ring-pink-500 border-pink-400 font-bold shadow-xs'
+                              : 'border-pink-100 hover:border-pink-300'
+                          }`}
+                          style={{ backgroundColor: overlay.bg }}
+                        >
+                          <span className="text-[11px] font-bold truncate" style={{ color: overlay.text }}>{overlay.name}</span>
+                          {activeConfig.overlayId === overlay.id && (
+                            <Check className="w-3 h-3 flex-shrink-0 ml-1" style={{ color: overlay.text }} />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center space-x-2 pt-2 border-t border-pink-100">
                     <button
                       type="button"
                       onClick={() => goToStep(1)}
-                      className="flex-1 py-2.5 px-3 bg-pink-50 hover:bg-pink-100 text-pink-700 font-semibold text-xs rounded-xl flex items-center justify-center space-x-1 border border-pink-200 transition-all whitespace-nowrap"
+                      className="py-2.5 px-3 bg-pink-50 hover:bg-pink-100 text-pink-700 font-semibold text-xs rounded-xl flex items-center justify-center space-x-1 border border-pink-200 transition-all whitespace-nowrap"
                     >
                       <ChevronLeft className="w-4 h-4" />
                       <span>Kembali</span>
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => goToStep(3)}
-                      className="flex-1 py-2.5 px-3 bg-pink-500 hover:bg-pink-600 text-white font-bold text-xs rounded-xl flex items-center justify-center space-x-1 transition-all shadow-md shadow-pink-200 whitespace-nowrap"
-                    >
-                      <span>Masuk Studio Foto</span>
-                      <ChevronRight className="w-4 h-4 text-white" />
-                    </button>
+                    {lobbyMode === 'solo' && (
+                      <button
+                        type="button"
+                        onClick={() => goToStep(3)}
+                        className="flex-1 py-2.5 px-3 bg-pink-500 hover:bg-pink-600 text-white font-bold text-xs rounded-xl flex items-center justify-center space-x-1 transition-all shadow-md shadow-pink-200 whitespace-nowrap"
+                      >
+                        <span>Masuk Studio Foto</span>
+                        <ChevronRight className="w-4 h-4 text-white" />
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -2399,142 +2609,243 @@ export default function PhotoboothPage() {
                 </span>
               </div>
 
-              {/* Viewfinder Camera Feed - Natural 4:3 Aspect Ratio for clean preview without eating vertical height */}
-              <div className="relative w-full max-w-md mx-auto aspect-[4/3] bg-pink-950/20 rounded-2xl overflow-hidden border-2 border-pink-200 flex items-center justify-center shadow-inner transition-all">
-                
-                {/* Camera Error / Permission Denied Message */}
-                {cameraError ? (
-                  <div className="p-4 text-center max-w-md space-y-3 bg-white/95 backdrop-blur rounded-2xl p-5 border border-pink-200 shadow-md">
-                    <div className="w-10 h-10 bg-pink-100 rounded-full flex items-center justify-center mx-auto text-pink-500">
-                      <CameraOff className="w-5 h-5" />
-                    </div>
-                    <div>
-                      <p className="text-xs text-slate-800 font-bold mb-1">Akses Kamera Dibatasi / Ditolak</p>
-                      <p className="text-[11px] text-slate-500 leading-relaxed">{cameraError}</p>
-                    </div>
+              {/* Viewfinder Camera Feed - Natural 4:3 Aspect Ratio for Solo or Dual Video Call Split View for Multiplayer */}
+              <div className="w-full">
+                {lobbyMode === 'multiplayer' ? (() => {
+                  const pKeys = session ? Object.keys(session.players) : [];
+                  const myP = session?.players[playerId];
+                  const partnerP = pKeys.map(k => session?.players[k]).find(p => p && p.id !== playerId);
 
-                    {/* File Upload & Preset Options */}
-                    <div className="pt-2 border-t border-pink-100 space-y-2">
-                      <label className="w-full py-2.5 px-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-pink-200 flex items-center justify-center space-x-2 cursor-pointer min-h-[40px]">
-                        <Upload className="w-4 h-4" />
-                        <span>Upload Foto dari Perangkat / HP</span>
-                        <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
-                      </label>
+                  return (
+                    <div className="relative w-full">
+                      <div className="grid grid-cols-2 gap-2 sm:gap-3 w-full">
+                        {/* 1. Kamera Saya (Local 60fps Live Video) */}
+                        <div className="relative aspect-[4/3] bg-pink-950/20 rounded-2xl overflow-hidden border-2 border-pink-300 flex items-center justify-center shadow-inner group">
+                          <div className="absolute top-2 left-2 z-10 flex items-center space-x-1.5 bg-slate-900/80 backdrop-blur-md px-2.5 py-1 rounded-full text-white text-[10px] font-bold border border-white/20">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                            <span>{myP?.name || 'Kamu'} (Saya)</span>
+                          </div>
 
-                      <div className="flex justify-center space-x-1.5 pt-1">
-                        {presets.map((preset, pIdx) => (
+                          <div className="absolute bottom-2 right-2 z-10">
+                            <span className={`px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase border shadow-xs ${myP?.isReady ? 'bg-emerald-500 text-white border-emerald-400' : 'bg-slate-900/70 text-slate-200 border-white/20'}`}>
+                              {myP?.isReady ? '✓ SIAP' : 'BELUM SIAP'}
+                            </span>
+                          </div>
+
+                          {!cameraActive && !useUploadFallback && (
+                            <div className="absolute inset-0 flex flex-col items-center justify-center bg-pink-50/90 text-pink-600 space-y-2 z-10">
+                              <RefreshCw className="w-5 h-5 animate-spin text-pink-500" />
+                              <span className="text-[11px] font-medium">Aktifkan Kamera...</span>
+                            </div>
+                          )}
+
+                          <video
+                            ref={setVideoRef}
+                            autoPlay
+                            playsInline
+                            muted
+                            className="w-full h-full object-cover transform -scale-x-100"
+                          />
+                        </div>
+
+                        {/* 2. Kamera Teman (Partner Live Video Stream) */}
+                        <div className="relative aspect-[4/3] bg-pink-950/30 rounded-2xl overflow-hidden border-2 border-pink-300 flex items-center justify-center shadow-inner">
+                          {partnerP ? (
+                            <>
+                              <div className="absolute top-2 left-2 z-10 flex items-center space-x-1.5 bg-slate-900/80 backdrop-blur-md px-2.5 py-1 rounded-full text-white text-[10px] font-bold border border-white/20">
+                                <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping" />
+                                <span>LIVE • {partnerP.name}</span>
+                              </div>
+
+                              <div className="absolute bottom-2 right-2 z-10">
+                                <span className={`px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase border shadow-xs ${partnerP.isReady ? 'bg-emerald-500 text-white border-emerald-400' : 'bg-slate-900/70 text-slate-200 border-white/20'}`}>
+                                  {partnerP.isReady ? '✓ SIAP' : 'BELUM SIAP'}
+                                </span>
+                              </div>
+
+                              {partnerP.liveCam ? (
+                                <img
+                                  src={partnerP.liveCam}
+                                  alt={partnerP.name}
+                                  className="w-full h-full object-cover transform -scale-x-100"
+                                />
+                              ) : (
+                                <div className="flex flex-col items-center justify-center text-center p-3 text-pink-200 space-y-2">
+                                  <div className="w-10 h-10 rounded-full bg-pink-500/20 flex items-center justify-center border border-pink-400/40 animate-pulse">
+                                    <Camera className="w-5 h-5 text-pink-300" />
+                                  </div>
+                                  <p className="text-[11px] font-bold text-white">Menunggu Kamera {partnerP.name}...</p>
+                                  <p className="text-[9px] text-pink-200/80">Kamera teman akan muncul otomatis di sini</p>
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <div className="flex flex-col items-center justify-center text-center p-4 text-pink-200 space-y-2">
+                              <div className="w-12 h-12 rounded-full bg-pink-500/20 flex items-center justify-center border border-pink-400/40">
+                                <Users className="w-6 h-6 text-pink-300" />
+                              </div>
+                              <p className="text-xs font-bold text-white">Menunggu Player 2</p>
+                              <p className="text-[10px] text-pink-200/80">Bagikan kode room <span className="font-mono font-bold text-pink-300">{roomCode}</span></p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Flash Overlay */}
+                      {flashActive && (
+                        <div className="absolute inset-0 bg-white animate-ping z-30 pointer-events-none rounded-2xl" />
+                      )}
+
+                      {/* Visual Countdown Overlay Over Dual Viewfinders */}
+                      {countdown !== null && (
+                        <div className="absolute inset-0 bg-pink-950/50 backdrop-blur-xs flex flex-col items-center justify-center z-20 space-y-2 rounded-2xl">
+                          <span className="text-8xl font-mono font-extrabold text-white drop-shadow-lg animate-bounce">
+                            {countdown}
+                          </span>
+                          <span className="text-xs font-bold text-pink-200 uppercase tracking-widest bg-pink-900/80 px-3 py-1 rounded-full border border-pink-400/30">
+                            SENYUM BERSAMA! 📸
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })() : (
+                  <div className="relative w-full max-w-md mx-auto aspect-[4/3] bg-pink-950/20 rounded-2xl overflow-hidden border-2 border-pink-200 flex items-center justify-center shadow-inner transition-all">
+                    {/* Camera Error / Permission Denied Message */}
+                    {cameraError ? (
+                      <div className="p-4 text-center max-w-md space-y-3 bg-white/95 backdrop-blur rounded-2xl p-5 border border-pink-200 shadow-md">
+                        <div className="w-10 h-10 bg-pink-100 rounded-full flex items-center justify-center mx-auto text-pink-500">
+                          <CameraOff className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <p className="text-xs text-slate-800 font-bold mb-1">Akses Kamera Dibatasi / Ditolak</p>
+                          <p className="text-[11px] text-slate-500 leading-relaxed">{cameraError}</p>
+                        </div>
+
+                        {/* File Upload & Preset Options */}
+                        <div className="pt-2 border-t border-pink-100 space-y-2">
+                          <label className="w-full py-2.5 px-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-pink-200 flex items-center justify-center space-x-2 cursor-pointer min-h-[40px]">
+                            <Upload className="w-4 h-4" />
+                            <span>Upload Foto dari Perangkat / HP</span>
+                            <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
+                          </label>
+
+                          <div className="flex justify-center space-x-1.5 pt-1">
+                            {presets.map((preset, pIdx) => (
+                              <button
+                                key={pIdx}
+                                type="button"
+                                onClick={() => {
+                                  setCurrentUploadPhoto(preset);
+                                  setUseUploadFallback(true);
+                                  setCameraError('');
+                                }}
+                                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all ${
+                                  currentUploadPhoto === preset && useUploadFallback
+                                    ? 'bg-pink-500 text-white border-pink-500 shadow-xs'
+                                    : 'bg-pink-50 border-pink-200 text-pink-700 hover:bg-pink-100'
+                                }`}
+                              >
+                                Preset {pIdx + 1}
+                              </button>
+                            ))}
+                          </div>
+
                           <button
-                            key={pIdx}
                             type="button"
                             onClick={() => {
-                              setCurrentUploadPhoto(preset);
-                              setUseUploadFallback(true);
                               setCameraError('');
+                              setUseUploadFallback(false);
+                              startCamera();
                             }}
-                            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all ${
-                              currentUploadPhoto === preset && useUploadFallback
-                                ? 'bg-pink-500 text-white border-pink-500 shadow-xs'
-                                : 'bg-pink-50 border-pink-200 text-pink-700 hover:bg-pink-100'
-                            }`}
+                            className="text-[11px] text-pink-600 underline hover:text-pink-700 font-medium block mx-auto pt-1"
                           >
-                            Preset {pIdx + 1}
+                            Coba Aktifkan Kamera Kembali
                           </button>
-                        ))}
+                        </div>
                       </div>
+                    ) : useUploadFallback ? (
+                      <div className="p-4 text-center space-y-3 bg-white/90 rounded-2xl border border-pink-100 p-5">
+                        <p className="text-xs text-slate-800 font-bold">Pilih Foto dari Perangkat atau Preset:</p>
+                        <div className="flex flex-wrap justify-center items-center gap-2">
+                          <label className="px-3.5 py-2 bg-pink-500 hover:bg-pink-600 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-pink-200 cursor-pointer flex items-center space-x-1.5 min-h-[38px]">
+                            <Upload className="w-4 h-4" />
+                            <span>Upload Foto Kamu</span>
+                            <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
+                          </label>
 
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setCameraError('');
-                          setUseUploadFallback(false);
-                          startCamera();
-                        }}
-                        className="text-[11px] text-pink-600 underline hover:text-pink-700 font-medium block mx-auto pt-1"
-                      >
-                        Coba Aktifkan Kamera Kembali
-                      </button>
-                    </div>
+                          {presets.map((preset, pIdx) => (
+                            <button
+                              key={pIdx}
+                              type="button"
+                              onClick={() => setCurrentUploadPhoto(preset)}
+                              className={`px-3 py-2 rounded-xl text-xs font-bold border transition-all min-h-[38px] ${
+                                currentUploadPhoto === preset
+                                  ? 'bg-pink-500 text-white border-pink-500 shadow-md'
+                                  : 'bg-white border-pink-200 text-slate-600 hover:bg-pink-50'
+                              }`}
+                            >
+                              Preset {pIdx + 1}
+                            </button>
+                          ))}
+                        </div>
+                        <div>
+                          <button
+                            type="button"
+                            onClick={() => { setUseUploadFallback(false); startCamera(); }}
+                            className="text-[11px] text-pink-600 underline hover:text-pink-700 font-medium"
+                          >
+                            Coba Aktifkan Kamera Kembali
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        {!cameraActive && (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center bg-pink-50/90 text-pink-600 space-y-2 z-10">
+                            <RefreshCw className="w-6 h-6 animate-spin text-pink-500" />
+                            <span className="text-xs font-medium">Menghubungkan Kamera...</span>
+                            <button
+                              type="button"
+                              onClick={() => setUseUploadFallback(true)}
+                              className="mt-2 px-3 py-1 bg-white border border-pink-200 text-[11px] text-pink-700 rounded-lg hover:bg-pink-100"
+                            >
+                              Pakai Mode Preset / Upload
+                            </button>
+                          </div>
+                        )}
+                        <video
+                          ref={setVideoRef}
+                          autoPlay
+                          playsInline
+                          muted
+                          className="w-full h-full object-cover transform -scale-x-100"
+                        />
+                        <canvas ref={canvasRef} className="hidden" />
+
+                        {/* Flash Overlay */}
+                        {flashActive && (
+                          <div className="absolute inset-0 bg-white animate-ping z-30 pointer-events-none" />
+                        )}
+
+                        {/* Visual Countdown Overlay */}
+                        {countdown !== null && (
+                          <div className="absolute inset-0 bg-pink-900/30 backdrop-blur-xs flex flex-col items-center justify-center z-20 space-y-2">
+                            <span className="text-7xl font-mono font-extrabold text-white drop-shadow-md animate-bounce">
+                              {countdown}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={stopPhotoShoot}
+                              className="px-3 py-1 bg-rose-500 hover:bg-rose-600 text-white text-[11px] font-bold rounded-xl transition-all shadow-md"
+                            >
+                              Batal Foto
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )}
                   </div>
-                ) : useUploadFallback ? (
-                  <div className="p-4 text-center space-y-3 bg-white/90 rounded-2xl border border-pink-100 p-5">
-                    <p className="text-xs text-slate-800 font-bold">Pilih Foto dari Perangkat atau Preset:</p>
-                    <div className="flex flex-wrap justify-center items-center gap-2">
-                      <label className="px-3.5 py-2 bg-pink-500 hover:bg-pink-600 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-pink-200 cursor-pointer flex items-center space-x-1.5 min-h-[38px]">
-                        <Upload className="w-4 h-4" />
-                        <span>Upload Foto Kamu</span>
-                        <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
-                      </label>
-
-                      {presets.map((preset, pIdx) => (
-                        <button
-                          key={pIdx}
-                          type="button"
-                          onClick={() => setCurrentUploadPhoto(preset)}
-                          className={`px-3 py-2 rounded-xl text-xs font-bold border transition-all min-h-[38px] ${
-                            currentUploadPhoto === preset
-                              ? 'bg-pink-500 text-white border-pink-500 shadow-md'
-                              : 'bg-white border-pink-200 text-slate-600 hover:bg-pink-50'
-                          }`}
-                        >
-                          Preset {pIdx + 1}
-                        </button>
-                      ))}
-                    </div>
-                    <div>
-                      <button
-                        type="button"
-                        onClick={() => { setUseUploadFallback(false); startCamera(); }}
-                        className="text-[11px] text-pink-600 underline hover:text-pink-700 font-medium"
-                      >
-                        Coba Aktifkan Kamera Kembali
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    {!cameraActive && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-pink-50/90 text-pink-600 space-y-2 z-10">
-                        <RefreshCw className="w-6 h-6 animate-spin text-pink-500" />
-                        <span className="text-xs font-medium">Menghubungkan Kamera...</span>
-                        <button
-                          type="button"
-                          onClick={() => setUseUploadFallback(true)}
-                          className="mt-2 px-3 py-1 bg-white border border-pink-200 text-[11px] text-pink-700 rounded-lg hover:bg-pink-100"
-                        >
-                          Pakai Mode Preset / Upload
-                        </button>
-                      </div>
-                    )}
-                    <video
-                      ref={setVideoRef}
-                      autoPlay
-                      playsInline
-                      muted
-                      className="w-full h-full object-cover transform -scale-x-100"
-                    />
-                    <canvas ref={canvasRef} className="hidden" />
-
-                    {/* Flash Overlay */}
-                    {flashActive && (
-                      <div className="absolute inset-0 bg-white animate-ping z-30 pointer-events-none" />
-                    )}
-
-                    {/* Visual Countdown Overlay */}
-                    {countdown !== null && (
-                      <div className="absolute inset-0 bg-pink-900/30 backdrop-blur-xs flex flex-col items-center justify-center z-20 space-y-2">
-                        <span className="text-7xl font-mono font-extrabold text-white drop-shadow-md animate-bounce">
-                          {countdown}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={stopPhotoShoot}
-                          className="px-3 py-1 bg-rose-500 hover:bg-rose-600 text-white text-[11px] font-bold rounded-xl transition-all shadow-md"
-                        >
-                          Batal Foto
-                        </button>
-                      </div>
-                    )}
-                  </>
                 )}
               </div>
 
