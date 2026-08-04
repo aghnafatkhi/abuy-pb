@@ -530,9 +530,10 @@ export default function PhotoboothPage() {
     cameraActiveRef.current = cameraActive;
   }, [cameraActive]);
 
-  // Initialize Player ID & Check URL Join Param
+  // Initialize Player ID & Check URL Join / Room Param
   useEffect(() => {
-    const timer = setTimeout(() => {
+    let active = true;
+    const timer = setTimeout(async () => {
       let id = safeLocalStorage.getItem('photobooth_player_id');
       if (!id) {
         id = 'player_' + Math.random().toString(36).substring(2, 11);
@@ -543,17 +544,47 @@ export default function PhotoboothPage() {
       const savedName = safeLocalStorage.getItem('photobooth_player_name') || `User-${id.slice(-4)}`;
       setPlayerName(savedName);
 
-      if (typeof window !== 'undefined') {
+      if (typeof window !== 'undefined' && active) {
         const params = new URLSearchParams(window.location.search);
-        const joinCode = params.get('join');
+        const joinCode = (params.get('room') || params.get('join') || '').trim().toUpperCase();
         if (joinCode) {
-          const formattedCode = joinCode.trim().toUpperCase();
-          setRoomIdInput(formattedCode);
+          setRoomIdInput(joinCode);
           setLobbyMode('multiplayer');
+          // Auto-join room from URL link
+          try {
+            const res = await safeFetch('/api/session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'join',
+                id: joinCode,
+                playerName: savedName,
+                playerId: id
+              })
+            });
+            const data = await res.json();
+            if (active) {
+              if (data && !data.error) {
+                setRoomCode(data.id);
+                setSession(data);
+                setStep(data.step || 2);
+                window.history.replaceState({}, '', `${window.location.pathname}?room=${data.id}`);
+              } else {
+                console.warn('URL room join returned error:', data?.error);
+                alert(`Tidak dapat bergabung ke room "${joinCode}": ${data?.error || 'Room tidak ditemukan.'}`);
+                window.history.replaceState({}, '', window.location.pathname);
+              }
+            }
+          } catch (e) {
+            console.error('Failed to auto-join room from URL:', e);
+          }
         }
       }
-    }, 0);
-    return () => clearTimeout(timer);
+    }, 100);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
   }, []);
 
   // Sync player info to localStorage
@@ -1543,6 +1574,9 @@ export default function PhotoboothPage() {
         setRoomCode(data.id);
         setSession(data);
         setStep(2);
+        if (typeof window !== 'undefined') {
+          window.history.replaceState({}, '', `${window.location.pathname}?room=${data.id}`);
+        }
       }
     } catch (err) {
       console.error(err);
@@ -1592,9 +1626,9 @@ export default function PhotoboothPage() {
         setRoomCode(data.id);
         setSession(data);
         setStep(2);
-        // Clear join param from URL
+        // Persist room param in browser address bar
         if (typeof window !== 'undefined') {
-          window.history.replaceState({}, '', window.location.pathname);
+          window.history.replaceState({}, '', `${window.location.pathname}?room=${data.id}`);
         }
       }
     } catch (err) {
@@ -1605,7 +1639,8 @@ export default function PhotoboothPage() {
 
   // Copy Room Link to clipboard
   const handleCopyLink = () => {
-    const link = `${window.location.origin}/?join=${roomCode}`;
+    if (!roomCode) return;
+    const link = `${window.location.origin}${window.location.pathname}?room=${roomCode}`;
     navigator.clipboard.writeText(link);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -2013,6 +2048,9 @@ export default function PhotoboothPage() {
     setRoomCode('');
     setSession(null);
     setStep(1);
+    if (typeof window !== 'undefined') {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
   };
 
   // Active Session and configuration pointer helper
@@ -2035,7 +2073,20 @@ export default function PhotoboothPage() {
           </div>
         </div>
 
-        <div className="flex items-center space-x-3">
+        <div className="flex items-center space-x-2 sm:space-x-3">
+          {lobbyMode === 'multiplayer' && roomCode && (
+            <button
+              type="button"
+              onClick={handleCopyLink}
+              className="flex items-center space-x-1.5 bg-pink-500 hover:bg-pink-600 text-white px-2.5 sm:px-3 py-1 rounded-full text-xs font-mono font-bold transition-all shadow-xs"
+              title="Klik untuk menyalin link web room"
+            >
+              <Share2 className="w-3.5 h-3.5" />
+              <span>Room: {roomCode}</span>
+              {copied && <span className="ml-1 text-[10px] bg-white text-pink-600 px-1.5 py-0.5 rounded-full font-bold">Tersalin!</span>}
+            </button>
+          )}
+
           <button
             type="button"
             onClick={toggleSound}
@@ -2046,7 +2097,7 @@ export default function PhotoboothPage() {
           </button>
 
           {playerName && (
-            <div className="flex items-center space-x-2 bg-pink-50 px-3 py-1 rounded-full text-xs font-mono text-pink-700 border border-pink-200">
+            <div className="hidden sm:flex items-center space-x-2 bg-pink-50 px-3 py-1 rounded-full text-xs font-mono text-pink-700 border border-pink-200">
               <span className="w-1.5 h-1.5 bg-pink-500 rounded-full animate-pulse" />
               <span>{playerName}</span>
             </div>

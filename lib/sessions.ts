@@ -9,6 +9,8 @@ import {
   getDocs, 
   writeBatch 
 } from 'firebase/firestore';
+import fs from 'fs';
+import path from 'path';
 
 export interface Player {
   id: string;
@@ -46,10 +48,44 @@ if (!globalThis.__sessionsMap) {
 }
 
 if (globalThis.__firestoreQuotaExceeded === undefined) {
-  globalThis.__firestoreQuotaExceeded = true;
+  globalThis.__firestoreQuotaExceeded = false;
 }
 
 const memoryStore = globalThis.__sessionsMap;
+const DISK_CACHE_FILE = path.join(process.cwd(), '.sessions-cache.json');
+
+function loadSessionsFromDisk() {
+  try {
+    if (fs.existsSync(DISK_CACHE_FILE)) {
+      const data = fs.readFileSync(DISK_CACHE_FILE, 'utf-8');
+      const obj = JSON.parse(data);
+      if (obj && typeof obj === 'object') {
+        for (const [key, sess] of Object.entries(obj)) {
+          if (sess && typeof sess === 'object' && (sess as Session).id) {
+            memoryStore.set(key.toUpperCase(), sess as Session);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Disk cache load silent catch
+  }
+}
+
+function saveSessionsToDisk() {
+  try {
+    const obj: Record<string, Session> = {};
+    for (const [key, sess] of memoryStore.entries()) {
+      obj[key] = sess;
+    }
+    fs.writeFileSync(DISK_CACHE_FILE, JSON.stringify(obj), 'utf-8');
+  } catch (e) {
+    // Disk cache save silent catch
+  }
+}
+
+// Load disk cache into memoryStore on startup
+loadSessionsFromDisk();
 
 function isQuotaError(e: any): boolean {
   if (!e) return false;
@@ -71,9 +107,23 @@ function markQuotaExceeded(e: any) {
 }
 
 export async function getSession(id: string): Promise<Session | null> {
-  const roomCode = id.toUpperCase();
+  if (!id) return null;
+  const roomCode = id.trim().toUpperCase();
   
   // 1. Check in-memory store first
+  if (memoryStore.has(roomCode)) {
+    return memoryStore.get(roomCode) || null;
+  }
+
+  // 1b. Case-insensitive memory lookup
+  for (const [key, sess] of memoryStore.entries()) {
+    if (key.toUpperCase() === roomCode) {
+      return sess;
+    }
+  }
+
+  // 1c. Load disk cache
+  loadSessionsFromDisk();
   if (memoryStore.has(roomCode)) {
     return memoryStore.get(roomCode) || null;
   }
@@ -86,6 +136,7 @@ export async function getSession(id: string): Promise<Session | null> {
       if (docSnap.exists()) {
         const session = docSnap.data() as Session;
         memoryStore.set(roomCode, session);
+        saveSessionsToDisk();
         return session;
       }
     } catch (e) {
@@ -139,8 +190,9 @@ export async function createSession(creatorName: string, creatorId: string): Pro
     updatedAt: Date.now()
   };
 
-  // Save to memory immediately
+  // Save to memory and disk immediately
   memoryStore.set(id, newSession);
+  saveSessionsToDisk();
 
   // Background persist to Firestore if available
   if (!globalThis.__firestoreQuotaExceeded) {
@@ -157,11 +209,11 @@ export async function createSession(creatorName: string, creatorId: string): Pro
 
 export async function joinSession(id: string, playerName: string, playerId: string): Promise<{ success: boolean; session?: Session; error?: string }> {
   try {
-    const roomCode = id.toUpperCase();
+    const roomCode = id.trim().toUpperCase();
     let session = await getSession(roomCode);
     
     if (!session) {
-      return { success: false, error: `Room "${roomCode}" tidak ditemukan. Pastikan kode room sudah benar.` };
+      return { success: false, error: `Room "${roomCode}" tidak ditemukan atau sudah berakhir. Pastikan kode room sudah benar.` };
     }
 
     const now = Date.now();
@@ -171,22 +223,33 @@ export async function joinSession(id: string, playerName: string, playerId: stri
       session.players[playerId].name = playerName || session.players[playerId].name;
       session.players[playerId].active = true;
       session.players[playerId].lastSeen = now;
+    } else if (playerId === session.creatorId) {
+      // Reconnecting creator with new tab / refreshed ID
+      session.players[playerId] = {
+        id: playerId,
+        name: playerName || 'Host',
+        isReady: false,
+        active: true,
+        photos: {},
+        livePhotos: {},
+        lastSeen: now
+      };
     } else {
-      // Prune stale/inactive players who haven't sent a heartbeat in 50 seconds
+      // Prune stale/inactive players who haven't sent a heartbeat in 60 seconds
       for (const [pId, p] of Object.entries(session.players)) {
-        if (!p.active || now - p.lastSeen > 50000) {
+        if (!p.active || now - p.lastSeen > 60000) {
           delete session.players[pId];
         }
       }
 
       // Check active players count
-      const activePlayers = Object.values(session.players).filter(p => p.active && now - p.lastSeen < 50000);
+      const activePlayers = Object.values(session.players).filter(p => p.active && now - p.lastSeen < 60000);
       
       if (activePlayers.length >= 2) {
         const playerNames = activePlayers.map(p => p.name).join(' & ');
         return { 
           success: false, 
-          error: `Room penuh. Sudah ada 2 pemain aktif (${playerNames}) di dalam room ini.` 
+          error: `Room "${roomCode}" penuh. Sudah ada 2 pemain aktif (${playerNames}) di dalam room ini.` 
         };
       }
       
@@ -204,6 +267,7 @@ export async function joinSession(id: string, playerName: string, playerId: stri
 
     session.updatedAt = now;
     memoryStore.set(roomCode, session);
+    saveSessionsToDisk();
 
     // Try Firestore persist
     if (!globalThis.__firestoreQuotaExceeded) {
@@ -224,7 +288,7 @@ export async function joinSession(id: string, playerName: string, playerId: stri
 
 export async function updateSession(id: string, updater: (session: Session) => void): Promise<Session | null> {
   try {
-    const roomCode = id.toUpperCase();
+    const roomCode = id.trim().toUpperCase();
     let session = await getSession(roomCode);
     
     if (!session) return null;
@@ -232,8 +296,9 @@ export async function updateSession(id: string, updater: (session: Session) => v
     updater(session);
     session.updatedAt = Date.now();
     
-    // Update memory
+    // Update memory & disk
     memoryStore.set(roomCode, session);
+    saveSessionsToDisk();
 
     // Try Firestore persist
     if (!globalThis.__firestoreQuotaExceeded) {
